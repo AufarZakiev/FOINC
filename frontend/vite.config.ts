@@ -12,4 +12,10 @@ export default defineConfig({
       },
     },
   },
+  test: {
+    include: [
+      "src/**/*.{test,spec}.{js,ts}",
+      "../modules/**/ui/**/*.{test,spec}.{js,ts}",
+    ],
+  },
 });
