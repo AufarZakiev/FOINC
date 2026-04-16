@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "preserve",
+    "importHelpers": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "vue": ["./node_modules/vue"],
+      "@/*": ["./src/*"],
+      "@upload-ui/*": ["../modules/upload/ui/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.vue", "../modules/upload/ui/**/*.vue"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

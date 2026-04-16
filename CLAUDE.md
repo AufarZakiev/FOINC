@@ -47,10 +47,30 @@ The agent outputs APPROVE or ISSUES.
 If ISSUES: re-run Step 5 with the reviewer's feedback appended. Max 3 iterations.
 If still not approved after 3 iterations: stop, report the unresolved issues to the user.
 
-### Step 7: Commit
+### Step 7: Test Writing
+Spawn an Agent with the prompt from `agents/test-writer.md`.
+Pass: the target module name, "test the full spec" (or the specific task).
+The agent reads spec.md, integrations/src/, and the module code.
+The agent writes tests in `modules/{module}/src/` and/or `modules/{module}/ui/`.
+
+### Step 8: Test Review
+Spawn an Agent with the prompt from `agents/test-reviewer.md`.
+Pass: the target module name.
+The agent reads spec.md and the tests written in Step 7.
+The agent outputs APPROVE or ISSUES.
+
+If ISSUES: re-run Step 7 with the reviewer's feedback appended. Max 3 iterations.
+If still not approved after 3 iterations: stop, report the unresolved issues to the user.
+
+### Step 9: Commit
 Commit all changes.
 
-The user reviews the commit. This is the only post-pipeline review point.
+### Step 10: Pull Request
+Push the branch and create a PR into `main` using `gh pr create`.
+Title: short description of the feature/module.
+Body: summary of what was implemented, link to the spec, test plan.
+
+The user reviews the PR. This is the only post-pipeline review point.
 
 ## Project Structure
 
@@ -58,7 +78,7 @@ The user reviews the commit. This is the only post-pipeline review point.
 - `ROADMAP.md` — module order and dependencies
 - `TECHNICAL_PAPER.md` — architecture, constraints, data flow (read by architect)
 - `WHITE_PAPER.md` — domain context (historical, not read by agents)
-- `agents/` — agent prompts (architect, spec-writer, spec-reviewer, code-writer, code-reviewer)
+- `agents/` — agent prompts (architect, spec-writer, spec-reviewer, code-writer, code-reviewer, test-writer, test-reviewer)
 - `modules/{name}/spec.md` — module specification
 - `modules/{name}/src/` — Rust code (Cargo crate)
 - `modules/{name}/ui/` — Vue/TS code

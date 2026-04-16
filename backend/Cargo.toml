@@ -1,0 +1,16 @@
+[package]
+name = "foinc-backend"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "foinc-backend"
+path = "src/main.rs"
+
+[dependencies]
+foinc-integrations = { path = "../integrations" }
+foinc-upload = { path = "../modules/upload" }
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
