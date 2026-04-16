@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "integrations",
+    "modules/upload",
+    "backend",
+]
+resolver = "2"
