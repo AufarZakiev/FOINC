@@ -65,7 +65,12 @@ If still not approved after 3 iterations: stop, report the unresolved issues to 
 ### Step 9: Commit
 Commit all changes.
 
-The user reviews the commit. This is the only post-pipeline review point.
+### Step 10: Pull Request
+Push the branch and create a PR into `main` using `gh pr create`.
+Title: short description of the feature/module.
+Body: summary of what was implemented, link to the spec, test plan.
+
+The user reviews the PR. This is the only post-pipeline review point.
 
 ## Project Structure
 
