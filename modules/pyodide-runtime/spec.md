@@ -1,7 +1,7 @@
 # Module: Pyodide Runtime
 
 ## Purpose
-Browser-side Web Worker that loads Pyodide, executes a scientist's Python script against CSV rows using a stdin/stdout contract, and performs timed dry runs on the first 3 rows.
+Browser-side Web Worker that loads Pyodide, executes a scientist's Python script against CSV rows using a stdin/stdout contract, and performs timed dry runs on 1 to 3 rows.
 
 ## State Machine
 
@@ -24,11 +24,13 @@ Browser-side Web Worker that loads Pyodide, executes a scientist's Python script
 
 | State | Event | → State | Side effect |
 |-------|-------|---------|-------------|
-| Pending | `dryRun(script, csvRows)` called | Executing | Send rows 1, 2, 3 sequentially as individual `exec` calls to the Worker |
-| Executing | All 3 rows return results | Complete | Return `DryRunResult` to caller |
-| Executing | Any row returns error | Failed | Return the error to caller; do not execute remaining rows |
+| Validating | `dryRun(script, csvRows)` called with 1-3 rows | Initializing | Create Worker; call `init()` |
+| Validating | `dryRun` called with 0 or >3 rows | Failed | Return error "dryRun requires 1 to 3 CSV rows" to caller; do not create Worker |
+| Initializing | Worker posts `ready` | Executing | Send first `exec` message |
+| Initializing | Worker init fails (enters Error state) | Failed | Return init error to caller; terminate Worker |
+| Executing | All rows return results | Complete | Return `DryRunResult` to caller; terminate Worker |
+| Executing | Any row returns error | Failed | Return the error to caller; do not execute remaining rows; terminate Worker |
 | Executing | Worker enters Terminated state | Failed | Return timeout error to caller |
-| Pending | Worker init fails (enters Error state) | Failed | Return init error to caller |
 
 ## API / Interface
 
@@ -51,6 +53,8 @@ Triggers Pyodide loading. Must be sent exactly once after Worker creation.
 }
 ```
 Executes the script with `stdinData` piped to `sys.stdin`. `stdinData` is a two-line string: the first line is the CSV header, the second line is the data row. Only valid when Worker is in `Idle` state.
+
+Each `exec` call carries exactly one data row. For a dry run of N rows (1-3), `dryRun` issues N `exec` calls, each with a two-line `stdinData` (header + one data row).
 
 **Worker → Host**
 
@@ -82,6 +86,8 @@ Sent on Pyodide load failure, script exception, or stdout limit exceeded.
 
 ### Exported TypeScript Functions
 
+`DryRunResult` and `ExecResult` are module-internal TypeScript types (not in `integrations/`); their shapes are defined inline below as part of the function signatures that expose them.
+
 `createPyodideWorker(): PyodideWorker`
 Creates and returns a Worker wrapper. Does not send `init` — caller must call `init()` on the returned handle.
 
@@ -95,7 +101,44 @@ Sends an `exec` message; resolves with `{ stdout: string, stderr: string, durati
 Forcibly terminates the underlying Web Worker.
 
 `dryRun(script: string, csvRows: string[], header: string): Promise<DryRunResult>`
-Creates a Worker, initializes it, executes `script` against each of the first 3 `csvRows` (each prefixed with `header`), collects results. Returns `DryRunResult`. Terminates the Worker when done. `csvRows` must contain exactly 3 rows (caller slices).
+Creates a Worker, initializes it, executes `script` against each row in `csvRows` (each prefixed with `header`), collects results. Returns `DryRunResult`. Terminates the Worker when done. `csvRows` must contain 1, 2, or 3 rows; otherwise rejects with "dryRun requires 1 to 3 CSV rows".
+
+`DryRunResult` shape:
+```
+{
+  rows: Array<{ input: string; stdout: string; stderr: string; durationMs: number }>;
+  totalDurationMs: number;
+}
+```
+`rows[i].input` is the raw CSV data line for row `i`. `totalDurationMs` is the sum of `rows[*].durationMs`.
+
+### UI Components
+
+Vue 3 + TypeScript Single File Components under `modules/pyodide-runtime/ui/`.
+
+`DryRunForm.vue`
+Collects the Python script and CSV input from the user.
+- Props: none.
+- Emits: `submit` with payload `{ script: string, header: string, csvRows: string[] }`.
+- UI: two inputs (script, CSV). Each input has a toggle between file upload and inline textarea. File uploads validated by extension: `.py` for script, `.csv` for CSV; mismatches surface an inline error and the `submit` event is not emitted.
+- CSV parsing: split on `\n`, trim each line, discard lines that are empty after trimming. First remaining line is `header`; subsequent remaining lines are `csvRows`.
+- Validation (all errors shown inline; `submit` is not emitted when any fires):
+  - 0 data rows (empty CSV or header only) → "CSV must contain at least 1 data row".
+  - More than 3 data rows → "dryRun requires 1 to 3 CSV rows".
+- Valid 1-3 data rows → emits `submit`.
+
+`DryRunResults.vue`
+Displays the outcome of a dry run.
+- Props: `result: DryRunResult`.
+- Emits: none.
+- UI: a table with one row per CSV data row, columns: input (the raw CSV line), output (a `<pre>` block of `stdout`), stderr (a `<pre>` block), `durationMs`. Footer shows `totalDurationMs`.
+
+`DryRunPanel.vue`
+Parent that wires the form to the `dryRun()` function and owns request state.
+- Props: none.
+- Emits: none.
+- State: `loading: boolean`, `error: string | null`, `result: DryRunResult | null`.
+- Data flow: renders `DryRunForm`; on `submit`, sets `loading=true`, calls `dryRun(script, csvRows, header)`; on resolve, stores `result` and renders `DryRunResults`; on reject, stores `error.message` and renders it inline. Only one of loading / error / result is visible at a time.
 
 ### Resource Limits
 
@@ -115,7 +158,7 @@ The Python environment has no access to:
 These are enforced by not providing the relevant Emscripten/Pyodide modules. Pyodide packages are loaded lazily on first `import` within a script (not eagerly at init).
 
 ## Non-goals
-- No aggregation detection — out of scope for this module.
-- No persistent state between `exec` calls — each execution is isolated.
-- No backend component — this module runs entirely in the browser.
-- No configurable row count for dry runs — fixed at 3 rows.
+- No aggregation detection, persistent state between `exec` calls, or backend component — each execution is isolated and runs entirely in the browser.
+- No more than 3 rows per dry run, and no CSV-structured rendering of script output — stdout is shown as raw text in a `<pre>` block.
+- No partial results on failure — if any row errors, the entire dry run fails and the panel shows only the error message.
+- No mounting of `DryRunPanel` — composition into the app shell lives in `frontend/`, not in this module.

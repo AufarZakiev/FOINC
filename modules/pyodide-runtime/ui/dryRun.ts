@@ -1,7 +1,7 @@
 /**
  * Dry-run executor.
  *
- * Creates a worker, initializes it, runs a script against each of 3 CSV rows
+ * Creates a worker, initializes it, runs a script against each of 1-3 CSV rows
  * (each prefixed with the header), collects results, and terminates the worker.
  * Stops on first error.
  */
@@ -9,17 +9,17 @@
 import { createPyodideWorker } from "./pyodideWorker";
 
 export interface DryRunResult {
-  rows: { input: string; output: string; durationMs: number }[];
+  rows: { input: string; stdout: string; stderr: string; durationMs: number }[];
   totalDurationMs: number;
 }
 
 /**
- * Runs `script` against each of the first 3 `csvRows`, each prefixed with `header`.
+ * Runs `script` against each of `csvRows` (1-3 rows), each prefixed with `header`.
  * Returns a DryRunResult with per-row results and totalDurationMs.
  * Stops on first error. Terminates the worker when done.
  *
  * @param script - Python source code to execute
- * @param csvRows - Exactly 3 CSV data rows (caller slices)
+ * @param csvRows - 1 to 3 CSV data rows (caller slices)
  * @param header - CSV header line to prepend to each row
  */
 export async function dryRun(
@@ -27,17 +27,21 @@ export async function dryRun(
   csvRows: string[],
   header: string,
 ): Promise<DryRunResult> {
-  if (csvRows.length !== 3) {
-    throw new Error(`dryRun requires exactly 3 CSV rows, got ${csvRows.length}`);
+  if (csvRows.length < 1 || csvRows.length > 3) {
+    throw new Error("dryRun requires 1 to 3 CSV rows");
   }
 
-  const totalStart = performance.now();
   const worker = createPyodideWorker();
 
   try {
     await worker.init();
 
-    const rows: { input: string; output: string; durationMs: number }[] = [];
+    const rows: {
+      input: string;
+      stdout: string;
+      stderr: string;
+      durationMs: number;
+    }[] = [];
 
     for (const row of csvRows) {
       const stdinData = header + "\n" + row;
@@ -46,13 +50,14 @@ export async function dryRun(
       const result = await worker.exec(script, stdinData);
 
       rows.push({
-        input: stdinData,
-        output: result.stdout,
+        input: row,
+        stdout: result.stdout,
+        stderr: result.stderr,
         durationMs: result.durationMs,
       });
     }
 
-    const totalDurationMs = performance.now() - totalStart;
+    const totalDurationMs = rows.reduce((acc, r) => acc + r.durationMs, 0);
     return { rows, totalDurationMs };
   } finally {
     worker.terminate();

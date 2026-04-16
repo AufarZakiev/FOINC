@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import UploadForm from "../../modules/upload/ui/UploadForm.vue";
+import DryRunPanel from "../../modules/pyodide-runtime/ui/DryRunPanel.vue";
 </script>
 
 <template>
@@ -10,6 +11,7 @@ import UploadForm from "../../modules/upload/ui/UploadForm.vue";
     </header>
     <main class="app-main">
       <UploadForm />
+      <DryRunPanel />
     </main>
   </div>
 </template>
@@ -41,5 +43,8 @@ import UploadForm from "../../modules/upload/ui/UploadForm.vue";
 
 .app-main {
   width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
 }
 </style>
