@@ -1,4 +1,4 @@
-import type { Job } from "../types/job";
+import type { Job } from "../../../integrations/ui/types";
 
 /**
  * Upload a CSV file and a Python script to the backend.

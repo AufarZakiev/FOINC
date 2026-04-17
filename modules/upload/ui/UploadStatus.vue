@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Job } from "../../../frontend/src/types/job";
+import type { Job } from "../../../integrations/ui/types";
 
 defineProps<{
   loading: boolean;

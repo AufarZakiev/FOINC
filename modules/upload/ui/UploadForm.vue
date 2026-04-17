@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { uploadFiles } from "../../../frontend/src/api/upload";
-import type { Job } from "../../../frontend/src/types/job";
+import { uploadFiles } from "./api";
+import type { Job } from "../../../integrations/ui/types";
 import UploadStatus from "./UploadStatus.vue";
 
 const csvFile = ref<File | null>(null);

@@ -21,8 +21,10 @@
     "src/**/*.ts",
     "src/**/*.vue",
     "../modules/upload/ui/**/*.vue",
+    "../modules/upload/ui/**/*.ts",
     "../modules/pyodide-runtime/ui/**/*.vue",
-    "../modules/pyodide-runtime/ui/**/*.ts"
+    "../modules/pyodide-runtime/ui/**/*.ts",
+    "../integrations/ui/**/*.ts"
   ],
   "exclude": ["../modules/**/ui/__tests__/**"],
   "references": [{ "path": "./tsconfig.node.json" }]
