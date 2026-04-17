@@ -1,6 +1,14 @@
 <script setup lang="ts">
+import { ref } from "vue";
 import UploadForm from "../../modules/upload/ui/UploadForm.vue";
 import DryRunPanel from "../../modules/pyodide-runtime/ui/DryRunPanel.vue";
+import type { UploadCompleted } from "../../integrations/ui/events";
+
+const upload = ref<UploadCompleted | null>(null);
+
+function onUploaded(payload: UploadCompleted) {
+  upload.value = payload;
+}
 </script>
 
 <template>
@@ -10,8 +18,8 @@ import DryRunPanel from "../../modules/pyodide-runtime/ui/DryRunPanel.vue";
       <p>Distributed Volunteer Computing Platform</p>
     </header>
     <main class="app-main">
-      <UploadForm />
-      <DryRunPanel />
+      <UploadForm @uploaded="onUploaded" />
+      <DryRunPanel v-if="upload" :upload="upload" />
     </main>
   </div>
 </template>
