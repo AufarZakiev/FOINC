@@ -2,7 +2,12 @@
 import { ref } from "vue";
 import { uploadFiles } from "./api";
 import type { Job } from "../../../integrations/ui/types";
+import type { UploadCompleted } from "../../../integrations/ui/events";
 import UploadStatus from "./UploadStatus.vue";
+
+const emit = defineEmits<{
+  uploaded: [payload: UploadCompleted];
+}>();
 
 const csvFile = ref<File | null>(null);
 const scriptFile = ref<File | null>(null);
@@ -76,7 +81,17 @@ async function handleSubmit() {
   error.value = null;
 
   try {
-    job.value = await uploadFiles(csvFile.value, scriptFile.value);
+    const uploadedJob = await uploadFiles(csvFile.value, scriptFile.value);
+    const [script, csv] = await Promise.all([
+      scriptFile.value.text(),
+      csvFile.value.text(),
+    ]);
+    job.value = uploadedJob;
+    emit("uploaded", {
+      jobId: uploadedJob.job_id,
+      script,
+      csv,
+    });
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : "Upload failed";
   } finally {
