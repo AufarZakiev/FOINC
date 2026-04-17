@@ -1,9 +1,9 @@
 /**
  * Dry-run executor.
  *
- * Creates a worker, initializes it, runs a script against each of 1-3 CSV rows
- * (each prefixed with the header), collects results, and terminates the worker.
- * Stops on first error.
+ * Creates a worker, initializes it, runs a script against each of 1-3 CSV data
+ * rows (piped individually to stdin — the CSV header is not included), collects
+ * results, and terminates the worker. Stops on first error.
  */
 
 import { createPyodideWorker } from "./pyodideWorker";
@@ -14,18 +14,17 @@ export interface DryRunResult {
 }
 
 /**
- * Runs `script` against each of `csvRows` (1-3 rows), each prefixed with `header`.
+ * Runs `script` against each of `csvRows` (1-3 rows). Each row is piped to
+ * `sys.stdin` on its own; the CSV header is not passed to the script.
  * Returns a DryRunResult with per-row results and totalDurationMs.
  * Stops on first error. Terminates the worker when done.
  *
  * @param script - Python source code to execute
  * @param csvRows - 1 to 3 CSV data rows (caller slices)
- * @param header - CSV header line to prepend to each row
  */
 export async function dryRun(
   script: string,
   csvRows: string[],
-  header: string,
 ): Promise<DryRunResult> {
   if (csvRows.length < 1 || csvRows.length > 3) {
     throw new Error("dryRun requires 1 to 3 CSV rows");
@@ -44,10 +43,9 @@ export async function dryRun(
     }[] = [];
 
     for (const row of csvRows) {
-      const stdinData = header + "\n" + row;
       // Stops on first error: exec rejects and the error propagates
       // out of this loop, through the try block, into the caller.
-      const result = await worker.exec(script, stdinData);
+      const result = await worker.exec(script, row);
 
       rows.push({
         input: row,

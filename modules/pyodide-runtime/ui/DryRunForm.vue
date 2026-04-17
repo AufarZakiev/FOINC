@@ -4,7 +4,7 @@ import { ref, computed } from "vue";
 type InputMode = "file" | "inline";
 
 const emit = defineEmits<{
-  submit: [payload: { script: string; header: string; csvRows: string[] }];
+  submit: [payload: { script: string; csvRows: string[] }];
 }>();
 
 const scriptMode = ref<InputMode>("file");
@@ -62,14 +62,15 @@ function handleCsvFileSelect(event: Event) {
   csvFile.value = file;
 }
 
-function parseCsv(text: string): { header: string; rows: string[] } | null {
+function parseCsv(text: string): { rows: string[] } | null {
   const lines = text
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
   if (lines.length === 0) return null;
-  const [header, ...rows] = lines;
-  return { header, rows };
+  // Drop the header (first line) — the worker does not receive it.
+  const [, ...rows] = lines;
+  return { rows };
 }
 
 const canSubmit = computed(() => {
@@ -135,7 +136,6 @@ async function handleSubmit() {
 
   emit("submit", {
     script: scriptSource,
-    header: parsed.header,
     csvRows: parsed.rows,
   });
 }

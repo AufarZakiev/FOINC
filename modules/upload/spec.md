@@ -129,12 +129,20 @@ Return metadata for a single job.
 
 | Component | Behavior |
 |-----------|----------|
-| `UploadForm` | Drag-and-drop zone or file picker. Accepts exactly one `.csv` and one `.py` file. Calls `POST /upload`. |
+| `UploadForm` | Drag-and-drop zone or file picker. Accepts exactly one `.csv` and one `.py` file. Calls `POST /upload`. On `201`, reads back the local CSV and script text and emits `uploaded`. |
 | `UploadStatus` | Displays progress during upload (loading state), then shows job metadata on success or error message on failure. |
+
+**Emits (cross-module contract):**
+
+| Event | Payload | Timing |
+|-------|---------|--------|
+| `uploaded` | `UploadCompleted` (see `integrations/ui/events.ts`) | Once, after `POST /upload` returns `201`. Payload carries `jobId` (from response), `script` (raw Python source), `csv` (raw CSV text). Not emitted on error. |
+
+The upload module does not know who listens to `uploaded` or what they do with it. Composition into any workflow is the responsibility of `frontend/`.
 
 ## Non-goals
 
-- No CSV parsing, preview, or dry-run execution (that is the `preview` module).
+- No CSV parsing, preview, or dry-run execution — the upload module only accepts, validates, stores, and announces files via the `uploaded` event. Downstream behavior is another module's responsibility.
 - No task splitting or distribution (that is the `task-distribution` module).
 - No authentication or authorization (not in MVP scope yet).
 - No cloud/S3 storage; files are stored on local disk only.

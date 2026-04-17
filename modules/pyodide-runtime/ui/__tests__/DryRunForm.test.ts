@@ -99,11 +99,10 @@ describe("DryRunForm.vue", () => {
 
     const payload = emissions![0][0] as {
       script: string;
-      header: string;
       csvRows: string[];
     };
     expect(payload.script).toBe("print('hi')");
-    expect(payload.header).toBe("name,age");
+    expect(payload).not.toHaveProperty("header");
     expect(payload.csvRows).toEqual(["Alice,30", "Bob,25"]);
   });
 
@@ -157,17 +156,16 @@ describe("DryRunForm.vue", () => {
     expect(emissions).toHaveLength(1);
     const payload = emissions![0][0] as {
       script: string;
-      header: string;
       csvRows: string[];
     };
     expect(payload.script).toBe("print('hello')");
-    expect(payload.header).toBe("a,b");
+    expect(payload).not.toHaveProperty("header");
     expect(payload.csvRows).toEqual(["1,2", "3,4"]);
   });
 
-  // ---- CSV parsing: trimming, empty-line handling, first-line header ----
+  // ---- CSV parsing: trimming, empty-line handling, header is dropped ----
 
-  it("trims lines, discards empty lines, and uses the first remaining line as header", async () => {
+  it("trims lines, discards empty lines, and drops the header (first remaining line)", async () => {
     await switchScriptToInline(wrapper);
     await switchCsvToInline(wrapper);
 
@@ -184,10 +182,10 @@ describe("DryRunForm.vue", () => {
     expect(emissions).toHaveLength(1);
     const payload = emissions![0][0] as {
       script: string;
-      header: string;
       csvRows: string[];
     };
-    expect(payload.header).toBe("name,age");
+    expect(payload).not.toHaveProperty("header");
+    // First non-empty line ("name,age") is treated as header and dropped.
     expect(payload.csvRows).toEqual(["Alice,30", "Bob,25"]);
   });
 
@@ -239,7 +237,6 @@ describe("DryRunForm.vue", () => {
     expect(emissions).toHaveLength(1);
     const payload = emissions![0][0] as {
       script: string;
-      header: string;
       csvRows: string[];
     };
     expect(payload.csvRows).toEqual(["only,row"]);
@@ -259,7 +256,6 @@ describe("DryRunForm.vue", () => {
     expect(emissions).toHaveLength(1);
     const payload = emissions![0][0] as {
       script: string;
-      header: string;
       csvRows: string[];
     };
     expect(payload.csvRows).toEqual(["a,1", "b,2"]);
@@ -279,7 +275,6 @@ describe("DryRunForm.vue", () => {
     expect(emissions).toHaveLength(1);
     const payload = emissions![0][0] as {
       script: string;
-      header: string;
       csvRows: string[];
     };
     expect(payload.csvRows).toEqual(["a,1", "b,2", "c,3"]);

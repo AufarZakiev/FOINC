@@ -12,7 +12,7 @@ Browser-side Web Worker that loads Pyodide, executes a scientist's Python script
 | Unloaded | `init` message received | Loading | Begin fetching Pyodide from `cdn.jsdelivr.net/pyodide/` |
 | Loading | Pyodide ready | Idle | Post `{ type: "ready" }` to host |
 | Loading | Pyodide fetch/init fails | Error | Post `{ type: "error", message }` to host |
-| Idle | `exec` message received | Running | Patch `sys.stdin` with provided CSV data; redirect `sys.stdout`/`sys.stderr`; start `performance.now()` timer; start 30 s timeout timer |
+| Idle | `exec` message received | Running | Patch `sys.stdin` with the provided data row (no CSV header); redirect `sys.stdout`/`sys.stderr`; start `performance.now()` timer; start 30 s timeout timer |
 | Running | Script completes | Idle | Post `{ type: "result", stdout, stderr, durationMs }` to host |
 | Running | Script raises exception | Idle | Post `{ type: "error", message }` to host (message = traceback string) |
 | Running | stdout exceeds 10 MB | Idle | Terminate execution; post `{ type: "error", message: "stdout limit exceeded (10 MB)" }` |
@@ -49,12 +49,12 @@ Triggers Pyodide loading. Must be sent exactly once after Worker creation.
 {
   "type": "exec",
   "script": "<python source code>",
-  "stdinData": "<header line>\n<data line>"
+  "stdinData": "<data line>"
 }
 ```
-Executes the script with `stdinData` piped to `sys.stdin`. `stdinData` is a two-line string: the first line is the CSV header, the second line is the data row. Only valid when Worker is in `Idle` state.
+Executes the script with `stdinData` piped to `sys.stdin`. `stdinData` is a single CSV data row; the CSV header is NOT included. Only valid when Worker is in `Idle` state.
 
-Each `exec` call carries exactly one data row. For a dry run of N rows (1-3), `dryRun` issues N `exec` calls, each with a two-line `stdinData` (header + one data row).
+Each `exec` call carries exactly one data row. For a dry run of N rows (1-3), `dryRun` issues N `exec` calls, each with a single-row `stdinData`.
 
 **Worker → Host**
 
@@ -100,8 +100,8 @@ Sends an `exec` message; resolves with `{ stdout: string, stderr: string, durati
 `PyodideWorker.terminate(): void`
 Forcibly terminates the underlying Web Worker.
 
-`dryRun(script: string, csvRows: string[], header: string): Promise<DryRunResult>`
-Creates a Worker, initializes it, executes `script` against each row in `csvRows` (each prefixed with `header`), collects results. Returns `DryRunResult`. Terminates the Worker when done. `csvRows` must contain 1, 2, or 3 rows; otherwise rejects with "dryRun requires 1 to 3 CSV rows".
+`dryRun(script: string, csvRows: string[]): Promise<DryRunResult>`
+Creates a Worker, initializes it, executes `script` against each row in `csvRows` (each row is piped to `sys.stdin` on its own — no header), collects results. Returns `DryRunResult`. Terminates the Worker when done. `csvRows` must contain 1, 2, or 3 rows; otherwise rejects with "dryRun requires 1 to 3 CSV rows".
 
 `DryRunResult` shape:
 ```
@@ -116,29 +116,26 @@ Creates a Worker, initializes it, executes `script` against each row in `csvRows
 
 Vue 3 + TypeScript Single File Components under `modules/pyodide-runtime/ui/`.
 
-`DryRunForm.vue`
-Collects the Python script and CSV input from the user.
-- Props: none.
-- Emits: `submit` with payload `{ script: string, header: string, csvRows: string[] }`.
-- UI: two inputs (script, CSV). Each input has a toggle between file upload and inline textarea. File uploads validated by extension: `.py` for script, `.csv` for CSV; mismatches surface an inline error and the `submit` event is not emitted.
-- CSV parsing: split on `\n`, trim each line, discard lines that are empty after trimming. First remaining line is `header`; subsequent remaining lines are `csvRows`.
-- Validation (all errors shown inline; `submit` is not emitted when any fires):
-  - 0 data rows (empty CSV or header only) → "CSV must contain at least 1 data row".
-  - More than 3 data rows → "dryRun requires 1 to 3 CSV rows".
-- Valid 1-3 data rows → emits `submit`.
+This module does not accept files or user text input — that is the upload module's job. UI components here consume an `UploadCompleted` payload (see `integrations/ui/events.ts`) and run a dry run against it.
 
 `DryRunResults.vue`
 Displays the outcome of a dry run.
 - Props: `result: DryRunResult`.
 - Emits: none.
-- UI: a table with one row per CSV data row, columns: input (the raw CSV line), output (a `<pre>` block of `stdout`), stderr (a `<pre>` block), `durationMs`. Footer shows `totalDurationMs`.
+- UI: a table with one row per CSV data row, columns: input (the raw CSV line), stdout (a `<pre>` block), stderr (a `<pre>` block), `durationMs`. Footer shows `totalDurationMs`.
 
 `DryRunPanel.vue`
-Parent that wires the form to the `dryRun()` function and owns request state.
-- Props: none.
+Runs a dry run for an already-uploaded job and renders the outcome.
+- Props: `upload: UploadCompleted` (from `integrations/ui/events.ts`). Required.
 - Emits: none.
 - State: `loading: boolean`, `error: string | null`, `result: DryRunResult | null`.
-- Data flow: renders `DryRunForm`; on `submit`, sets `loading=true`, calls `dryRun(script, csvRows, header)`; on resolve, stores `result` and renders `DryRunResults`; on reject, stores `error.message` and renders it inline. Only one of loading / error / result is visible at a time.
+- Data flow:
+  1. From `upload.csv`, split on `\n`, trim each line, discard lines empty after trimming. Drop the first remaining line (CSV header). The next 1-3 lines become `csvRows`.
+  2. If parsing yields 0 rows, render an inline error `"CSV must contain at least 1 data row"` and do not call `dryRun`.
+  3. If parsing yields >3 rows, use only the first 3 (caller slice matches `dryRun`'s contract).
+  4. Render a "Run dry run" button. On click: set `loading=true`, call `dryRun(upload.script, csvRows)`; on resolve store `result` and render `DryRunResults`; on reject store `error.message` and render inline.
+- Only one of idle-button / loading / error / result is visible at a time.
+- When the `upload` prop changes to a new payload, reset `error` and `result` to `null`.
 
 ### Resource Limits
 
@@ -158,7 +155,7 @@ The Python environment has no access to:
 These are enforced by not providing the relevant Emscripten/Pyodide modules. Pyodide packages are loaded lazily on first `import` within a script (not eagerly at init).
 
 ## Non-goals
+- No file upload, file picker, or text input in UI — the module consumes an already-uploaded `UploadCompleted`; sourcing files is the upload module's responsibility.
 - No aggregation detection, persistent state between `exec` calls, or backend component — each execution is isolated and runs entirely in the browser.
-- No more than 3 rows per dry run, and no CSV-structured rendering of script output — stdout is shown as raw text in a `<pre>` block.
-- No partial results on failure — if any row errors, the entire dry run fails and the panel shows only the error message.
-- No mounting of `DryRunPanel` — composition into the app shell lives in `frontend/`, not in this module.
+- No more than 3 rows per dry run, no partial results on failure, and no CSV-structured rendering of script output — stdout is shown as raw text in a `<pre>` block.
+- No mounting of `DryRunPanel` — composition and routing live in `frontend/`, not in this module.

@@ -82,6 +82,13 @@ The user reviews the PR. This is the only post-pipeline review point.
 - `modules/{name}/spec.md` — module specification
 - `modules/{name}/src/` — Rust code (Cargo crate)
 - `modules/{name}/ui/` — Vue/TS code
-- `integrations/src/` — shared types crate, documented via `///` comments
+- `integrations/src/` — shared Rust types (backend/cross-service), documented via `///` comments
+- `integrations/ui/` — shared TypeScript contracts (UI events, cross-module DTOs), documented via JSDoc
 - `backend/` — thin Axum shell composing modules
-- `frontend/` — thin Vite shell composing module UIs
+- `frontend/` — thin Vite shell composing module UIs and owning flows (which module hands off to which)
+
+## Cross-module contracts
+
+If two modules need to communicate (events, shared DTOs, flow state), the contract lives in `integrations/` — never in another module's spec. Each module's spec references the type by name. Renaming a field in `integrations/` forces both sides to update at once; that is the synchronization mechanism.
+
+UI flows (the order in which modules appear, how outputs feed inputs) live in `frontend/`, not in module specs. A module stays unaware of every other module.

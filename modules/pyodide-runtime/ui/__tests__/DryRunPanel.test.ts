@@ -11,7 +11,7 @@ import type { DryRunResult } from "../dryRun";
 
 const { mockDryRun } = vi.hoisted(() => ({
   mockDryRun:
-    vi.fn<(script: string, csvRows: string[], header: string) => Promise<DryRunResult>>(),
+    vi.fn<(script: string, csvRows: string[]) => Promise<DryRunResult>>(),
 }));
 
 vi.mock("../dryRun", () => ({
@@ -44,7 +44,6 @@ function makeDeferred<T>(): {
 
 const samplePayload = {
   script: "print('hi')",
-  header: "name,age",
   csvRows: ["Alice,30", "Bob,25"],
 };
 
@@ -65,7 +64,7 @@ describe("DryRunPanel.vue", () => {
     mockDryRun.mockReset();
   });
 
-  it("calls dryRun with (script, csvRows, header) when the form submits", async () => {
+  it("calls dryRun with (script, csvRows) when the form submits", async () => {
     mockDryRun.mockResolvedValue(sampleResult);
 
     const wrapper = mount(DryRunPanel);
@@ -77,7 +76,6 @@ describe("DryRunPanel.vue", () => {
     expect(mockDryRun).toHaveBeenCalledWith(
       samplePayload.script,
       samplePayload.csvRows,
-      samplePayload.header,
     );
   });
 
@@ -137,7 +135,7 @@ describe("DryRunPanel.vue", () => {
     expect(wrapper.findComponent(DryRunResults).exists()).toBe(false);
   });
 
-  it("uses a generic fallback message when the rejection is not an Error", async () => {
+  it("stringifies the rejection when it is not an Error", async () => {
     mockDryRun.mockRejectedValue("something weird");
 
     const wrapper = mount(DryRunPanel);
@@ -147,7 +145,20 @@ describe("DryRunPanel.vue", () => {
 
     const err = wrapper.find(".status--error");
     expect(err.exists()).toBe(true);
-    expect(err.text()).toBe("Dry run failed");
+    expect(err.text()).toBe("something weird");
+  });
+
+  it("falls back to a placeholder when the rejection message is empty", async () => {
+    mockDryRun.mockRejectedValue(new Error(""));
+
+    const wrapper = mount(DryRunPanel);
+    const form = wrapper.findComponent(DryRunForm);
+    form.vm.$emit("submit", samplePayload);
+    await flushPromises();
+
+    const err = wrapper.find(".status--error");
+    expect(err.exists()).toBe(true);
+    expect(err.text()).toBe("Dry run failed (no error message)");
   });
 
   it("clears the prior error on a new submit", async () => {

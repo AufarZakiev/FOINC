@@ -10,7 +10,6 @@ const result = ref<DryRunResult | null>(null);
 
 async function handleSubmit(payload: {
   script: string;
-  header: string;
   csvRows: string[];
 }) {
   loading.value = true;
@@ -18,9 +17,11 @@ async function handleSubmit(payload: {
   result.value = null;
 
   try {
-    result.value = await dryRun(payload.script, payload.csvRows, payload.header);
+    result.value = await dryRun(payload.script, payload.csvRows);
   } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : "Dry run failed";
+    console.error("[DryRunPanel] dryRun failed:", e);
+    const msg = e instanceof Error ? e.message : String(e);
+    error.value = msg && msg.trim().length > 0 ? msg : "Dry run failed (no error message)";
   } finally {
     loading.value = false;
   }
