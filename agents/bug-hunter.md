@@ -41,6 +41,8 @@ Concrete action the main assistant should take next. Examples:
 - `Compositor only; rewire frontend/src/App.vue because...`
 - `env/infra — run: docker compose up -d db; cargo run -p foinc-backend`
 
+**Always list the files you expect the fix to touch.** The main assistant needs this to pick the right base branch: if any of those files were modified in an open, unmerged PR, the fix must stack on that PR instead of branching from `main`. You do not decide the branch yourself — just hand over the file list.
+
 ### 5. Regression test (optional)
 If you can cheaply describe a failing test that reproduces the bug (unit-level, deterministic), write the test idea in ~5 lines of pseudocode. Say which test file it belongs to. If a test would be expensive or flaky (UI pixel diffs, races, env-dependent), skip this section.
 
