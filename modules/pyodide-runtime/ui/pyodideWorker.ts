@@ -69,7 +69,7 @@ export class PyodideWorker {
    * Sends an `exec` message; resolves with ExecResult; rejects on `error` or timeout.
    * If the 30s timeout fires, the Worker is terminated and subsequent calls reject immediately.
    */
-  exec(script: string, stdinData: string): Promise<ExecResult> {
+  exec(script: string, argv: string[]): Promise<ExecResult> {
     if (this.terminated) {
       return Promise.reject(new Error("Worker is terminated"));
     }
@@ -119,7 +119,7 @@ export class PyodideWorker {
 
       this.worker.addEventListener("message", handler);
       this.worker.addEventListener("error", errorHandler);
-      this.worker.postMessage({ type: "exec", script, stdinData });
+      this.worker.postMessage({ type: "exec", script, argv });
     });
   }
 

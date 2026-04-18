@@ -1,7 +1,7 @@
 # Module: Pyodide Runtime
 
 ## Purpose
-Browser-side Web Worker that loads Pyodide, executes a scientist's Python script against CSV rows using a stdin/stdout contract, and performs timed dry runs on 1 to 3 rows.
+Browser-side Web Worker that loads Pyodide, executes a scientist's Python script against CSV rows using an argv/stdout contract, and performs timed dry runs on 1 to 3 rows.
 
 ## State Machine
 
@@ -12,7 +12,7 @@ Browser-side Web Worker that loads Pyodide, executes a scientist's Python script
 | Unloaded | `init` message received | Loading | Begin fetching Pyodide from `cdn.jsdelivr.net/pyodide/` |
 | Loading | Pyodide ready | Idle | Post `{ type: "ready" }` to host |
 | Loading | Pyodide fetch/init fails | Error | Post `{ type: "error", message }` to host |
-| Idle | `exec` message received | Running | Patch `sys.stdin` with the provided data row (no CSV header); redirect `sys.stdout`/`sys.stderr`; start `performance.now()` timer; start 30 s timeout timer |
+| Idle | `exec` message received | Running | Patch `sys.argv = ['<user-script>', ...argv]`; patch `sys.stdin` to empty `StringIO('')`; redirect `sys.stdout`/`sys.stderr`; start `performance.now()` timer; start 30 s timeout timer |
 | Running | Script completes | Idle | Post `{ type: "result", stdout, stderr, durationMs }` to host |
 | Running | Script raises exception | Idle | Post `{ type: "error", message }` to host (message = traceback string) |
 | Running | stdout exceeds 10 MB | Idle | Terminate execution; post `{ type: "error", message: "stdout limit exceeded (10 MB)" }` |
@@ -49,12 +49,12 @@ Triggers Pyodide loading. Must be sent exactly once after Worker creation.
 {
   "type": "exec",
   "script": "<python source code>",
-  "stdinData": "<data line>"
+  "argv": ["1", "3"]
 }
 ```
-Executes the script with `stdinData` piped to `sys.stdin`. `stdinData` is a single CSV data row; the CSV header is NOT included. Only valid when Worker is in `Idle` state.
+Executes the script with `sys.argv = ["<user-script>", ...argv]` and `sys.stdin` patched to empty `StringIO("")`. `argv` is the CSV data row pre-split by the host into fields (header is NOT included). Only valid when Worker is in `Idle` state.
 
-Each `exec` call carries exactly one data row. For a dry run of N rows (1-3), `dryRun` issues N `exec` calls, each with a single-row `stdinData`.
+Each `exec` call carries the script plus the CSV row pre-split into fields. For a dry run of N rows (1-3), `dryRun` issues N `exec` calls, each with one pre-split `argv` array.
 
 **Worker → Host**
 
@@ -94,14 +94,16 @@ Creates and returns a Worker wrapper. Does not send `init` — caller must call 
 `PyodideWorker.init(): Promise<void>`
 Sends the `init` message; resolves when `ready` is received; rejects on `error`.
 
-`PyodideWorker.exec(script: string, stdinData: string): Promise<ExecResult>`
+`PyodideWorker.exec(script: string, argv: string[]): Promise<ExecResult>`
 Sends an `exec` message; resolves with `{ stdout: string, stderr: string, durationMs: number }`; rejects on `error` or timeout. If the 30 s timeout fires, the Worker is terminated and subsequent calls reject immediately.
 
 `PyodideWorker.terminate(): void`
 Forcibly terminates the underlying Web Worker.
 
 `dryRun(script: string, csvRows: string[]): Promise<DryRunResult>`
-Creates a Worker, initializes it, executes `script` against each row in `csvRows` (each row is piped to `sys.stdin` on its own — no header), collects results. Returns `DryRunResult`. Terminates the Worker when done. `csvRows` must contain 1, 2, or 3 rows; otherwise rejects with "dryRun requires 1 to 3 CSV rows".
+Creates a Worker, initializes it, splits each row in `csvRows` via `row.split(",")` to produce an `argv` array, executes `script` against each `argv` (no header), and collects results. Returns `DryRunResult`. Terminates the Worker when done. `csvRows` must contain 1, 2, or 3 rows; otherwise rejects with "dryRun requires 1 to 3 CSV rows".
+
+CSV-split limitation: values containing commas are not supported; rows are split on the first and every subsequent comma without quoting/escaping awareness (not RFC 4180-compliant).
 
 `DryRunResult` shape:
 ```
@@ -159,3 +161,4 @@ These are enforced by not providing the relevant Emscripten/Pyodide modules. Pyo
 - No aggregation detection, persistent state between `exec` calls, or backend component — each execution is isolated and runs entirely in the browser.
 - No more than 3 rows per dry run, no partial results on failure, and no CSV-structured rendering of script output — stdout is shown as raw text in a `<pre>` block.
 - No mounting of `DryRunPanel` — composition and routing live in `frontend/`, not in this module.
+- No RFC 4180-compliant CSV parsing — commas are a hard field separator; quoted fields, escaped quotes, and embedded newlines are not recognized.

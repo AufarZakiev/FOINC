@@ -6,7 +6,7 @@ import type { ExecResult } from "../pyodideWorker";
 // ---------------------------------------------------------------------------
 
 const mockInit = vi.fn<() => Promise<void>>();
-const mockExec = vi.fn<(script: string, stdinData: string) => Promise<ExecResult>>();
+const mockExec = vi.fn<(script: string, argv: string[]) => Promise<ExecResult>>();
 const mockTerminate = vi.fn();
 
 vi.mock("../pyodideWorker", () => ({
@@ -37,8 +37,8 @@ describe("dryRun()", () => {
     mockInit.mockResolvedValue(undefined);
 
     // Default: exec returns a valid result
-    mockExec.mockImplementation(async (_script: string, stdinData: string) => ({
-      stdout: stdinData,
+    mockExec.mockImplementation(async (_script: string, argv: string[]) => ({
+      stdout: argv.join(","),
       stderr: "",
       durationMs: 10,
     }));
@@ -175,13 +175,62 @@ describe("dryRun()", () => {
     expect(callOrder.filter((c) => c === "exec")).toHaveLength(3);
   });
 
-  it("calls exec sequentially with one raw data row per call (no header)", async () => {
+  it("calls exec sequentially with argv split from each raw data row (no header)", async () => {
     await dryRun(script, rows);
 
     expect(mockExec).toHaveBeenCalledTimes(3);
-    expect(mockExec).toHaveBeenNthCalledWith(1, script, "Alice,30");
-    expect(mockExec).toHaveBeenNthCalledWith(2, script, "Bob,25");
-    expect(mockExec).toHaveBeenNthCalledWith(3, script, "Carol,40");
+    expect(mockExec).toHaveBeenNthCalledWith(1, script, ["Alice", "30"]);
+    expect(mockExec).toHaveBeenNthCalledWith(2, script, ["Bob", "25"]);
+    expect(mockExec).toHaveBeenNthCalledWith(3, script, ["Carol", "40"]);
+  });
+
+  // ---- argv splitting contract ------------------------------------------
+
+  it("passes argv as an array (not a string) to exec for each row", async () => {
+    await dryRun(script, ["1,3"]);
+
+    expect(mockExec).toHaveBeenCalledTimes(1);
+    const secondArg = mockExec.mock.calls[0][1];
+    expect(Array.isArray(secondArg)).toBe(true);
+    expect(secondArg).toEqual(["1", "3"]);
+  });
+
+  it("splits row '1,3' into argv ['1','3']", async () => {
+    await dryRun(script, ["1,3"]);
+
+    expect(mockExec).toHaveBeenCalledWith(script, ["1", "3"]);
+  });
+
+  it("splits empty row '' into argv [''] (JS split convention)", async () => {
+    await dryRun(script, [""]);
+
+    expect(mockExec).toHaveBeenCalledTimes(1);
+    expect(mockExec).toHaveBeenCalledWith(script, [""]);
+  });
+
+  it("splits a row with no commas ('alone') into argv ['alone']", async () => {
+    await dryRun(script, ["alone"]);
+
+    expect(mockExec).toHaveBeenCalledTimes(1);
+    expect(mockExec).toHaveBeenCalledWith(script, ["alone"]);
+  });
+
+  it("3-row dry run calls exec 3 times with 3 argv arrays", async () => {
+    await dryRun(script, ["1,3", "a,b,c", "x"]);
+
+    expect(mockExec).toHaveBeenCalledTimes(3);
+    expect(mockExec).toHaveBeenNthCalledWith(1, script, ["1", "3"]);
+    expect(mockExec).toHaveBeenNthCalledWith(2, script, ["a", "b", "c"]);
+    expect(mockExec).toHaveBeenNthCalledWith(3, script, ["x"]);
+  });
+
+  it("exposes CSV fields as argv (regression for stdin→argv contract)", async () => {
+    // This test verifies the contract at the dryRun↔PyodideWorker boundary.
+    // Real Pyodide is mocked; we assert the worker was asked with argv=["1","3"].
+    mockExec.mockResolvedValue({ stdout: "4.0\n", stderr: "", durationMs: 10 });
+    const script = "import sys; print(float(sys.argv[1]) + float(sys.argv[2]))";
+    await dryRun(script, ["1,3"]);
+    expect(mockExec).toHaveBeenCalledWith(script, ["1", "3"]);
   });
 
   // ---- Error handling -----------------------------------------------------
