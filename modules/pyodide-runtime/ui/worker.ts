@@ -147,7 +147,7 @@ sys._initial_modules = set(sys.modules.keys())
   if (msg.type === "exec" && state === "idle") {
     state = "running";
     const script: string = msg.script;
-    const stdinData: string = msg.stdinData;
+    const argv: string[] = msg.argv;
 
     let stdoutContent = "";
     let stderrContent = "";
@@ -156,13 +156,13 @@ sys._initial_modules = set(sys.modules.keys())
 
     let execStep = "start";
     try {
-      // Pass stdinData to the Python environment via globals
+      // Pass argv to the Python environment via globals
       execStep = "globals.set";
-      pyodide!.globals.set("__stdin_data__", stdinData);
+      pyodide!.globals.set("__argv__", argv);
 
-      // Patch sys.stdin with stdinData, capture stderr with StringIO,
-      // and capture stdout with a limit-checking wrapper that aborts
-      // execution when 10 MB is exceeded.
+      // Set sys.argv = ["<user-script>", ...argv], patch sys.stdin to empty
+      // StringIO(""), capture stderr with StringIO, and capture stdout with
+      // a limit-checking wrapper that aborts execution when 10 MB is exceeded.
       execStep = "patch-io";
       pyodide!.runPython(`
 import sys
@@ -187,10 +187,11 @@ class _LimitedStdout:
     def flush(self):
         pass
 
-sys.stdin = io.StringIO(__stdin_data__)
+sys.argv = ['<user-script>', *list(__argv__)]
+sys.stdin = io.StringIO("")
 sys.stdout = _LimitedStdout(${STDOUT_LIMIT_BYTES})
 sys.stderr = io.StringIO()
-del __stdin_data__
+del __argv__
 `);
 
       // Load any packages the script imports
