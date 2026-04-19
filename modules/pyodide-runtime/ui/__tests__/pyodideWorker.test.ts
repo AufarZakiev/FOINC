@@ -102,7 +102,7 @@ describe("PyodideWorker", () => {
       mock.postFromWorker({ type: "error", message: "load failed" });
       await initPromise.catch(() => {});
 
-      await expect(pw.exec("code", "data")).rejects.toThrow(
+      await expect(pw.exec("code", ["data"])).rejects.toThrow(
         "Worker is terminated",
       );
     });
@@ -112,12 +112,12 @@ describe("PyodideWorker", () => {
 
   describe("exec()", () => {
     it("resolves with ExecResult when worker posts result", async () => {
-      const execPromise = pw.exec("print('hi')", "col\nval");
+      const execPromise = pw.exec("print('hi')", ["1", "3"]);
 
       expect(mock.worker.postMessage).toHaveBeenCalledWith({
         type: "exec",
         script: "print('hi')",
-        stdinData: "col\nval",
+        argv: ["1", "3"],
       });
 
       mock.postFromWorker({
@@ -133,8 +133,34 @@ describe("PyodideWorker", () => {
       expect(result.durationMs).toBe(12.5);
     });
 
+    it("posts argv as an array in the exec message", async () => {
+      const execPromise = pw.exec("print('x')", ["1", "3"]);
+
+      // The second argument to exec must be forwarded as `argv` (array), not `stdinData`.
+      expect(mock.worker.postMessage).toHaveBeenCalledWith({
+        type: "exec",
+        script: "print('x')",
+        argv: ["1", "3"],
+      });
+      // And the value must be the exact array reference shape.
+      const posted = (mock.worker.postMessage as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
+      expect(Array.isArray(posted.argv)).toBe(true);
+      expect(posted.argv).toEqual(["1", "3"]);
+      expect("stdinData" in posted).toBe(false);
+
+      // Clean up the pending promise.
+      mock.postFromWorker({
+        type: "result",
+        stdout: "",
+        stderr: "",
+        durationMs: 0,
+      });
+      await execPromise;
+    });
+
     it("rejects when worker posts error", async () => {
-      const execPromise = pw.exec("bad code", "col\nval");
+      const execPromise = pw.exec("bad code", ["1", "3"]);
 
       mock.postFromWorker({
         type: "error",
@@ -145,7 +171,7 @@ describe("PyodideWorker", () => {
     });
 
     it("rejects with stdout limit error when worker reports it", async () => {
-      const execPromise = pw.exec("print('x' * 10**8)", "col\nval");
+      const execPromise = pw.exec("print('x' * 10**8)", ["1", "3"]);
 
       mock.postFromWorker({
         type: "error",
@@ -160,13 +186,13 @@ describe("PyodideWorker", () => {
     it("rejects immediately if worker is terminated", async () => {
       pw.terminate();
 
-      await expect(pw.exec("print('hi')", "col\nval")).rejects.toThrow(
+      await expect(pw.exec("print('hi')", ["1", "3"])).rejects.toThrow(
         "Worker is terminated",
       );
     });
 
     it("removes the message listener after result", async () => {
-      const execPromise = pw.exec("code", "data");
+      const execPromise = pw.exec("code", ["data"]);
       mock.postFromWorker({
         type: "result",
         stdout: "",
@@ -182,7 +208,7 @@ describe("PyodideWorker", () => {
     });
 
     it("removes the message listener after error", async () => {
-      const execPromise = pw.exec("code", "data");
+      const execPromise = pw.exec("code", ["data"]);
       mock.postFromWorker({ type: "error", message: "fail" });
       await execPromise.catch(() => {});
 
@@ -205,7 +231,7 @@ describe("PyodideWorker", () => {
     });
 
     it("terminates the worker and rejects after 30s timeout", async () => {
-      const execPromise = pw.exec("import time; time.sleep(60)", "col\nval");
+      const execPromise = pw.exec("import time; time.sleep(60)", ["1", "3"]);
 
       // Advance time to just past the 30s timeout
       vi.advanceTimersByTime(30_000);
@@ -217,7 +243,7 @@ describe("PyodideWorker", () => {
     });
 
     it("does not trigger timeout if result arrives before 30s", async () => {
-      const execPromise = pw.exec("print('fast')", "col\nval");
+      const execPromise = pw.exec("print('fast')", ["1", "3"]);
 
       // Advance 10 seconds, then respond
       vi.advanceTimersByTime(10_000);
@@ -237,12 +263,12 @@ describe("PyodideWorker", () => {
     });
 
     it("subsequent exec calls reject after timeout termination", async () => {
-      const execPromise = pw.exec("slow", "col\nval");
+      const execPromise = pw.exec("slow", ["1", "3"]);
       vi.advanceTimersByTime(30_000);
       await execPromise.catch(() => {});
 
       // After timeout, the worker is terminated; further calls should reject
-      await expect(pw.exec("print('hi')", "col\nval")).rejects.toThrow(
+      await expect(pw.exec("print('hi')", ["1", "3"])).rejects.toThrow(
         "Worker is terminated",
       );
     });

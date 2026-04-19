@@ -2,8 +2,9 @@
  * Dry-run executor.
  *
  * Creates a worker, initializes it, runs a script against each of 1-3 CSV data
- * rows (piped individually to stdin — the CSV header is not included), collects
- * results, and terminates the worker. Stops on first error.
+ * rows (each row is split via `row.split(",")` and passed as argv — the CSV
+ * header is not included), collects results, and terminates the worker.
+ * Stops on first error.
  */
 
 import { createPyodideWorker } from "./pyodideWorker";
@@ -14,13 +15,15 @@ export interface DryRunResult {
 }
 
 /**
- * Runs `script` against each of `csvRows` (1-3 rows). Each row is piped to
- * `sys.stdin` on its own; the CSV header is not passed to the script.
- * Returns a DryRunResult with per-row results and totalDurationMs.
- * Stops on first error. Terminates the worker when done.
+ * Runs `script` against each of `csvRows` (1-3 rows). Each row is split via
+ * `row.split(",")` and passed as `argv` (so the script sees
+ * `sys.argv = ["<user-script>", ...fields]`); the CSV header is not passed
+ * to the script. Returns a DryRunResult with per-row results and
+ * totalDurationMs. Stops on first error. Terminates the worker when done.
  *
  * @param script - Python source code to execute
- * @param csvRows - 1 to 3 CSV data rows (caller slices)
+ * @param csvRows - 1 to 3 CSV data rows (caller slices); each row is split
+ *                  on comma into argv fields (no RFC 4180 quoting support)
  */
 export async function dryRun(
   script: string,
@@ -45,7 +48,7 @@ export async function dryRun(
     for (const row of csvRows) {
       // Stops on first error: exec rejects and the error propagates
       // out of this loop, through the try block, into the caller.
-      const result = await worker.exec(script, row);
+      const result = await worker.exec(script, row.split(","));
 
       rows.push({
         input: row,

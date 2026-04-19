@@ -87,13 +87,49 @@ Body: summary of what was implemented, link to the spec, test plan.
 
 The user reviews the PR. This is the only post-pipeline review point.
 
+## Bug Fix Flow
+
+When the user reports a bug (description + logs, or "this is broken because Y"), use this flow instead of SDD directly.
+
+### Step B1: Hunt
+Spawn an Agent with the prompt from `agents/bug-hunter.md`.
+Pass: the user's bug description and any attached logs verbatim.
+The agent reads freely across the whole repo (specs, module code, integrations, shells, tests) and returns a diagnosis report with a classification (`spec-gap` / `code-drift` / `contract-bug` / `composition-bug` / `env/infra`) and a concrete route to SDD.
+The agent's context is one-shot — after it returns, discard it.
+
+### Step B2: Confirm
+**STOP: show the diagnosis and route to the user. Wait for approval or redirection.**
+Bug-hunter can misdiagnose, especially in mutt cases. Cheap to sanity-check once; expensive to run SDD on the wrong trail.
+
+### Step B3: Choose the branch base
+Before creating the fix branch, determine its base:
+
+1. Look at the files the bug-hunter plans to touch.
+2. Run `gh pr list --state open --json number,headRefName,title` to see open PRs.
+3. For each open PR, check whether any of its commits touch those files (`git log origin/<base>..origin/<headRefName> -- <path>`).
+4. If **yes** for exactly one open PR → base the fix branch on that PR's `headRefName`, and the fix PR must target the same `headRefName` as base (not `main`). Stack the fix on top of the feature PR.
+5. If **no** matching open PR → base on `main` as usual.
+6. If multiple open PRs touch the files → stop and ask the user which stack the fix belongs to.
+
+This prevents PRs from racing each other into `main` with divergent contracts.
+
+### Step B4: Execute the route
+Run the specific SDD entrypoint the bug-hunter handed off:
+- `spec-gap` → SDD from Step 3 (spec-writer) for the named module(s)
+- `code-drift` → SDD from Step 5 (code-writer), skip architect/spec
+- `contract-bug` → edit `integrations/` first, then SDD from Step 3 for every module the contract touches
+- `composition-bug` → Step 9 (compositor) only
+- `env/infra` → not SDD; follow the manual checklist from the report
+
+Steps 10 and 11 (Commit, PR) apply as usual. When creating the PR via `gh pr create`, pass `--base <chosen base>` explicitly — do not rely on `gh`'s default of `main`.
+
 ## Project Structure
 
 - `constitution.md` — spec format and rules
 - `ROADMAP.md` — module order and dependencies
 - `TECHNICAL_PAPER.md` — architecture, constraints, data flow (read by architect)
 - `WHITE_PAPER.md` — domain context (historical, not read by agents)
-- `agents/` — agent prompts (architect, spec-writer, spec-reviewer, code-writer, code-reviewer, test-writer, test-reviewer, compositor)
+- `agents/` — agent prompts (architect, spec-writer, spec-reviewer, code-writer, code-reviewer, test-writer, test-reviewer, compositor, bug-hunter)
 - `modules/{name}/spec.md` — module specification
 - `modules/{name}/src/` — Rust code (Cargo crate)
 - `modules/{name}/ui/` — Vue/TS code
