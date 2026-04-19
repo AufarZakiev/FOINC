@@ -20,3 +20,18 @@ export interface UploadCompleted {
   /** Raw CSV text as uploaded (not a path). Includes header line. */
   csv: string;
 }
+
+/**
+ * Payload emitted by the task-distribution module once a job has been split
+ * into tasks and moved into `processing`. Emitter is `StartJobButton` after
+ * a successful `POST /jobs/{id}/start`; the consumer is the frontend shell,
+ * which advances the wizard to the volunteer view. The payload carries the
+ * backend-assigned `jobId` and the number of tasks inserted so the shell can
+ * surface a confirmation without another round trip.
+ */
+export interface JobStarted {
+  /** UUID v4 of the job that was started, matches `Job.job_id`. */
+  jobId: string;
+  /** Number of tasks the backend inserted for this job. */
+  taskCount: number;
+}

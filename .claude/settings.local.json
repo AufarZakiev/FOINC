@@ -3,10 +3,10 @@
     "allow": [
       "mcp__context7__resolve-library-id",
       "mcp__context7__query-docs",
-      "Bash(cargo check *)",
-      "Bash(npm install *)",
-      "Bash(npx vue-tsc *)",
-      "Bash(npx vite *)"
+      "Bash(*)",
+      "Edit(*)",
+      "Write(*)",
+      "Read(*)"
     ]
   }
 }

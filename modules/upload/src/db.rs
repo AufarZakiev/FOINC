@@ -17,6 +17,9 @@ pub async fn insert_job(pool: &PgPool, job: &Job) -> Result<(), sqlx::Error> {
     .bind(job.script_size_bytes)
     .bind(match &job.status {
         JobStatus::Uploaded => "uploaded",
+        JobStatus::Processing => "processing",
+        JobStatus::Completed => "completed",
+        JobStatus::Failed => "failed",
     })
     .bind(job.created_at)
     .execute(pool)
@@ -77,6 +80,9 @@ impl JobRow {
     fn into_job(self) -> Job {
         let status = match self.status.as_str() {
             "uploaded" => JobStatus::Uploaded,
+            "processing" => JobStatus::Processing,
+            "completed" => JobStatus::Completed,
+            "failed" => JobStatus::Failed,
             _ => JobStatus::Uploaded, // fallback for unknown statuses from downstream modules
         };
         Job {
