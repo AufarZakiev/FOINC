@@ -10,7 +10,6 @@
     "noEmit": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "baseUrl": ".",
     "paths": {
       "vue": ["./node_modules/vue"],
       "@/*": ["./src/*"],
