@@ -70,10 +70,20 @@ pub async fn start_job_handler(
         }
     };
 
+    // Read the redundancy target from `FOINC_REDUNDANCY` at handler time.
+    // This keeps the env var hot-reload-friendly (no process restart needed
+    // to switch between `FOINC_REDUNDANCY=1` local demos and the default
+    // of 2). Invalid or non-positive values fall back to 2.
+    let redundancy_target: i16 = std::env::var("FOINC_REDUNDANCY")
+        .ok()
+        .and_then(|v| v.parse::<i16>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2);
+
     // Insert tasks. Even when `rows` is empty we still commit — the job
     // has already moved to `processing` and the task count is a faithful
     // zero.
-    let task_count = match db::insert_pending_tasks(&pool, id, &rows).await {
+    let task_count = match db::insert_pending_tasks(&pool, id, &rows, redundancy_target).await {
         Ok(n) => n,
         Err(_) => {
             return (
@@ -931,11 +941,69 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Phase 4 — FOINC_REDUNDANCY env var handling
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_start_job_handler_respects_foinc_redundancy_env_var() {
+        // FOINC_REDUNDANCY=3 → every task row inserted by start_job_handler
+        // must have redundancy_target=3.
+        //
+        // `DataDirGuard::new()` already acquires the crate-wide `ENV_LOCK`
+        // for the lifetime of this test, so mutating FOINC_REDUNDANCY in
+        // this scope is already serialized against other tests. We clean up
+        // the env var before `data_guard` drops (which releases the lock).
+        let data_guard = DataDirGuard::new();
+        std::env::set_var("FOINC_REDUNDANCY", "3");
+
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            std::env::remove_var("FOINC_REDUNDANCY");
+            return;
+        };
+
+        let job_id = Uuid::new_v4();
+        insert_job_row(&pool, job_id, "uploaded").await;
+        write_job_files(
+            data_guard.path(),
+            job_id,
+            "col\n1\n2\n",
+            "print('ok')",
+        );
+
+        let response = start_job_handler(
+            State(pool.clone()),
+            Path(job_id),
+            Some(axum::Json(StartJobRequest { chunk_size: None })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Every inserted task must carry redundancy_target = 3.
+        let targets: Vec<i16> = sqlx::query_scalar(
+            r#"SELECT redundancy_target FROM tasks WHERE job_id = $1"#,
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(
+            targets.iter().all(|t| *t == 3),
+            "all tasks must have redundancy_target=3, got {:?}",
+            targets
+        );
+
+        std::env::remove_var("FOINC_REDUNDANCY");
+    }
+
     #[tokio::test]
     async fn test_next_task_handler_flips_job_to_failed_when_orphan_is_last_sibling() {
         // Variant A: job has one Completed sibling and one orphaned task.
-        // After handler fails the orphan, sibling-terminality recompute sees
-        // >=1 Completed -> job stays `completed`.
+        // Phase-4 rule: one Completed sibling + one Failed (all terminal) ->
+        // job Failed. After handler fails the orphan, the job flips to
+        // `failed`, NOT `completed` — any Failed sibling forces the job
+        // Failed under the tightened terminality rule.
         //
         // Variant B: job has two orphaned tasks. Handler fails both, so every
         // sibling is Failed -> job flips to `failed`.
@@ -1005,7 +1073,9 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        // Orphan was failed; job stays `completed` (>=1 Completed sibling).
+        // Orphan was failed; Phase-4 rule: any Failed sibling + all terminal
+        // -> job flips to `failed` (the one Completed sibling does NOT save
+        // the job).
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 r#"SELECT status FROM tasks WHERE task_id = $1"#
@@ -1024,7 +1094,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap(),
-            "completed"
+            "failed"
         );
 
         // ---- Variant B ---------------------------------------------------

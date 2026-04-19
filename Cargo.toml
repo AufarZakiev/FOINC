@@ -3,6 +3,7 @@ members = [
     "integrations",
     "modules/upload",
     "modules/task-distribution",
+    "modules/result-aggregation",
     "backend",
 ]
 resolver = "2"

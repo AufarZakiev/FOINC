@@ -11,6 +11,7 @@ path = "src/main.rs"
 foinc-integrations = { path = "../integrations" }
 foinc-upload = { path = "../modules/upload" }
 foinc-task-distribution = { path = "../modules/task-distribution" }
+foinc-result-aggregation = { path = "../modules/result-aggregation" }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 tokio = { version = "1", features = ["full"] }

@@ -364,6 +364,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "foinc-integrations",
+ "foinc-result-aggregation",
  "foinc-task-distribution",
  "foinc-upload",
  "sqlx",
@@ -383,15 +384,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "foinc-result-aggregation"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "foinc-integrations",
+ "hex",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "foinc-task-distribution"
 version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
  "foinc-integrations",
+ "foinc-result-aggregation",
  "http-body-util",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "uuid",

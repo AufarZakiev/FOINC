@@ -1,19 +1,23 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import UploadForm from "../../modules/upload/ui/UploadForm.vue";
 import DryRunPanel from "../../modules/pyodide-runtime/ui/DryRunPanel.vue";
 import StartJobButton from "../../modules/task-distribution/ui/StartJobButton.vue";
+import DownloadResultButton from "../../modules/result-aggregation/ui/DownloadResultButton.vue";
 import { deleteJob } from "../../modules/upload/ui/api";
 import type {
   JobStarted,
   UploadCompleted,
 } from "../../integrations/ui/events";
 import type { Toast } from "../../integrations/ui/notifications";
+import type { Job, JobStatus } from "../../integrations/ui/types";
 import ToastContainer from "./ToastContainer.vue";
 import VolunteerView from "./VolunteerView.vue";
 
 type ToastWithId = Toast & { id: number };
 type Route = "scientist" | "volunteer";
+
+const JOB_POLL_INTERVAL_MS = 3000;
 
 function routeFromHash(): Route {
   return window.location.hash === "#/volunteer" ? "volunteer" : "scientist";
@@ -31,14 +35,17 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener("hashchange", onHashChange);
+  stopJobPolling();
 });
 
 const step = ref<1 | 2>(1);
 const upload = ref<UploadCompleted | null>(null);
 const startedJob = ref<JobStarted | null>(null);
+const jobStatus = ref<JobStatus | null>(null);
 const toasts = ref<ToastWithId[]>([]);
 
 let nextToastId = 1;
+let jobPollTimer: ReturnType<typeof setInterval> | null = null;
 
 function pushToast(t: Toast) {
   toasts.value.push({ ...t, id: nextToastId++ });
@@ -47,6 +54,65 @@ function pushToast(t: Toast) {
 function removeToast(id: number) {
   toasts.value = toasts.value.filter((t) => t.id !== id);
 }
+
+async function fetchJobStatus(jobId: string): Promise<JobStatus | null> {
+  try {
+    const res = await fetch(`/api/jobs/${jobId}`);
+    if (!res.ok) {
+      return null;
+    }
+    const job = (await res.json()) as Job;
+    return job.status;
+  } catch {
+    return null;
+  }
+}
+
+function stopJobPolling() {
+  if (jobPollTimer !== null) {
+    clearInterval(jobPollTimer);
+    jobPollTimer = null;
+  }
+}
+
+function startJobPolling(jobId: string) {
+  stopJobPolling();
+  // Fire immediately, then on an interval.
+  void pollOnce(jobId);
+  jobPollTimer = setInterval(() => {
+    void pollOnce(jobId);
+  }, JOB_POLL_INTERVAL_MS);
+}
+
+async function pollOnce(jobId: string) {
+  // Bail if the job we're polling for is no longer the active one.
+  if (startedJob.value === null || startedJob.value.jobId !== jobId) {
+    return;
+  }
+  const status = await fetchJobStatus(jobId);
+  if (status === null) {
+    return;
+  }
+  // Still the active job?
+  if (startedJob.value === null || startedJob.value.jobId !== jobId) {
+    return;
+  }
+  jobStatus.value = status;
+  if (status === "completed" || status === "failed") {
+    stopJobPolling();
+  }
+}
+
+watch(
+  () => startedJob.value?.jobId ?? null,
+  (jobId) => {
+    stopJobPolling();
+    jobStatus.value = null;
+    if (jobId !== null) {
+      startJobPolling(jobId);
+    }
+  },
+);
 
 function onUploaded(payload: UploadCompleted) {
   upload.value = payload;
@@ -85,6 +151,21 @@ const taskCountLabel = computed(() =>
       ? "1 task queued"
       : `${startedJob.value.taskCount} tasks queued`,
 );
+
+const statusLabel = computed(() => {
+  switch (jobStatus.value) {
+    case "uploaded":
+      return "Status: uploaded";
+    case "processing":
+      return "Status: processing";
+    case "completed":
+      return "Status: completed";
+    case "failed":
+      return "Status: failed";
+    default:
+      return "";
+  }
+});
 </script>
 
 <template>
@@ -137,16 +218,25 @@ const taskCountLabel = computed(() =>
             @notify="pushToast"
           />
         </template>
-        <section v-else class="job-confirmation" role="status">
-          <h2 class="job-confirmation__title">Job started</h2>
-          <p class="job-confirmation__body">
-            {{ taskCountLabel }}.
-            <a class="job-confirmation__link" href="#/volunteer"
-              >Open the volunteer page</a
-            >
-            to help run them.
-          </p>
-        </section>
+        <template v-else>
+          <section class="job-confirmation" role="status">
+            <h2 class="job-confirmation__title">Job started</h2>
+            <p class="job-confirmation__body">
+              {{ taskCountLabel }}.
+              <a class="job-confirmation__link" href="#/volunteer"
+                >Open the volunteer page</a
+              >
+              to help run them.
+            </p>
+            <p v-if="statusLabel" class="job-confirmation__status">
+              {{ statusLabel }}
+            </p>
+          </section>
+          <DownloadResultButton
+            :jobId="startedJob.jobId"
+            :jobStatus="jobStatus ?? 'processing'"
+          />
+        </template>
         <button type="button" class="back-button" @click="onBack">Back</button>
       </template>
     </main>
@@ -263,6 +353,13 @@ const taskCountLabel = computed(() =>
   margin: 0;
   font-size: 0.95rem;
   line-height: 1.4;
+}
+
+.job-confirmation__status {
+  margin: 0.5rem 0 0;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: #1b5e20;
 }
 
 .job-confirmation__link {

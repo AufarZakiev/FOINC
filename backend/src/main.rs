@@ -39,6 +39,10 @@ async fn main() {
             "/tasks/stats",
             get(foinc_task_distribution::task_stats_handler),
         )
+        .route(
+            "/jobs/{id}/result",
+            get(foinc_result_aggregation::get_result_handler),
+        )
         .layer(cors)
         .with_state(pool);
 
