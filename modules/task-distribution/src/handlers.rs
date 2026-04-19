@@ -92,41 +92,80 @@ pub async fn start_job_handler(
 }
 
 /// Handler for `POST /tasks/next`.
+///
+/// Implements the orphan-recovery loop described in the spec: after a
+/// successful `pick_next_task`, the job's script and CSV are read from
+/// disk. On any IO failure the picked task is orphan-failed via
+/// `fail_task` and the loop continues, looking for another candidate.
+/// Returns `204` when no candidate remains, `200` with a `TaskDispatch`
+/// when a readable task is found, and `500` if the pathological case of
+/// too many orphans is hit in a single request.
 pub async fn next_task_handler(
     State(pool): State<PgPool>,
     axum::Json(req): axum::Json<NextTaskRequest>,
 ) -> Response {
-    let picked = match db::pick_next_task(&pool, req.worker_id).await {
-        Ok(Some(p)) => p,
-        Ok(None) => return StatusCode::NO_CONTENT.into_response(),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({ "error": "Database error" })),
-            )
-                .into_response();
-        }
-    };
+    /// Safety bound on the orphan-recovery loop. In a healthy system every
+    /// iteration either returns a dispatch, 204s, or fails exactly one
+    /// orphaned task — so this cap only trips on a pathological backlog.
+    const MAX_ORPHAN_ITERATIONS: usize = 100;
 
-    let script = match db::read_job_script(picked.job_id).await {
-        Ok(s) => s,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({ "error": "Failed to read job script" })),
-            )
-                .into_response();
-        }
-    };
+    for _ in 0..MAX_ORPHAN_ITERATIONS {
+        let picked = match db::pick_next_task(&pool, req.worker_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => return StatusCode::NO_CONTENT.into_response(),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({ "error": "Database error" })),
+                )
+                    .into_response();
+            }
+        };
 
-    let dispatch = TaskDispatch {
-        task_id: picked.task_id,
-        job_id: picked.job_id,
-        script,
-        input_rows: picked.input_rows,
-        deadline_at: picked.deadline_at,
-    };
-    (StatusCode::OK, axum::Json(json!(dispatch))).into_response()
+        // Orphan-recovery step: attempt to read both script and CSV. Any
+        // IO failure (ENOENT, permission, etc.) triggers `fail_task` and
+        // loops for another candidate.
+        let script = match db::read_job_script(picked.job_id).await {
+            Ok(s) => s,
+            Err(_) => {
+                if db::fail_task(&pool, picked.task_id).await.is_err() {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({ "error": "Database error" })),
+                    )
+                        .into_response();
+                }
+                continue;
+            }
+        };
+
+        if db::find_job_csv(picked.job_id).await.is_err() {
+            if db::fail_task(&pool, picked.task_id).await.is_err() {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({ "error": "Database error" })),
+                )
+                    .into_response();
+            }
+            continue;
+        }
+
+        let dispatch = TaskDispatch {
+            task_id: picked.task_id,
+            job_id: picked.job_id,
+            script,
+            input_rows: picked.input_rows,
+            deadline_at: picked.deadline_at,
+        };
+        return (StatusCode::OK, axum::Json(json!(dispatch))).into_response();
+    }
+
+    // Exhausted the safety bound — give up rather than spin forever.
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(json!({ "error": "too many orphaned tasks — giving up" })),
+    )
+        .into_response()
 }
 
 /// Handler for `POST /tasks/{id}/submit`.
@@ -675,5 +714,379 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -------------------------------------------------------------------
+    // next_task_handler — orphan-recovery loop
+    // -------------------------------------------------------------------
+
+    /// Directly insert a task row with an explicit `created_at`. The pick
+    /// query orders by `tasks.created_at ASC`, so this helper lets us force
+    /// the candidate order deterministically in orphan-loop tests.
+    async fn insert_task_row_at(
+        pool: &PgPool,
+        task_id: Uuid,
+        job_id: Uuid,
+        status: &str,
+        attempts: i32,
+        input_rows: &[&str],
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        let rows: Vec<String> = input_rows.iter().map(|s| s.to_string()).collect();
+        sqlx::query(
+            r#"
+            INSERT INTO tasks
+                (task_id, job_id, chunk_index, input_rows, status, attempts, created_at)
+            VALUES
+                ($1, $2, 0, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(task_id)
+        .bind(job_id)
+        .bind(&rows)
+        .bind(status)
+        .bind(attempts)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_next_task_handler_fails_orphan_and_returns_next_readable() {
+        // Seed: an older orphan task (no job files on disk) and a newer
+        // readable task (job files present). The pick query orders by
+        // `created_at ASC`, so the orphan is picked first. Handler should
+        // fail_task it, loop, pick the readable task, and return 200.
+        let guard = DataDirGuard::new();
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let now = Utc::now();
+
+        // Orphan job — no directory on disk.
+        let orphan_job = Uuid::new_v4();
+        insert_job_row(&pool, orphan_job, "processing").await;
+        let orphan_task = Uuid::new_v4();
+        insert_task_row_at(
+            &pool,
+            orphan_task,
+            orphan_job,
+            "pending",
+            0,
+            &["orphan_row"],
+            now - Duration::seconds(120),
+        )
+        .await;
+
+        // Readable job — files present.
+        let readable_job = Uuid::new_v4();
+        insert_job_row(&pool, readable_job, "processing").await;
+        write_job_files(guard.path(), readable_job, "col\nv\n", "print('ok')");
+        let readable_task = Uuid::new_v4();
+        insert_task_row_at(
+            &pool,
+            readable_task,
+            readable_job,
+            "pending",
+            0,
+            &["readable_row"],
+            now - Duration::seconds(60),
+        )
+        .await;
+
+        let worker_id = Uuid::new_v4();
+        let response = next_task_handler(
+            State(pool.clone()),
+            axum::Json(NextTaskRequest { worker_id }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_json(response).await;
+        assert_eq!(body["task_id"], readable_task.to_string());
+        assert_eq!(body["job_id"], readable_job.to_string());
+        assert_eq!(body["script"], "print('ok')");
+        assert_eq!(body["input_rows"], serde_json::json!(["readable_row"]));
+
+        // Orphan was failed by the handler's orphan-recovery path.
+        let orphan_status: String =
+            sqlx::query_scalar(r#"SELECT status FROM tasks WHERE task_id = $1"#)
+                .bind(orphan_task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphan_status, "failed");
+
+        // Readable task is Assigned (to us) and has a live InFlight.
+        let readable_status: String =
+            sqlx::query_scalar(r#"SELECT status FROM tasks WHERE task_id = $1"#)
+                .bind(readable_task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(readable_status, "assigned");
+    }
+
+    #[tokio::test]
+    async fn test_next_task_handler_returns_204_when_all_orphans() {
+        // Seed only orphan tasks (no files on disk). Handler should loop
+        // through every candidate, fail each, and eventually return 204.
+        let _guard = DataDirGuard::new();
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let now = Utc::now();
+
+        // 3 orphan tasks under 3 distinct jobs — no files for any.
+        let mut orphan_tasks = Vec::new();
+        for i in 0..3 {
+            let job_id = Uuid::new_v4();
+            insert_job_row(&pool, job_id, "processing").await;
+            let task_id = Uuid::new_v4();
+            insert_task_row_at(
+                &pool,
+                task_id,
+                job_id,
+                "pending",
+                0,
+                &["orphan"],
+                now - Duration::seconds(60 * (3 - i)),
+            )
+            .await;
+            orphan_tasks.push(task_id);
+        }
+
+        let response = next_task_handler(
+            State(pool.clone()),
+            axum::Json(NextTaskRequest {
+                worker_id: Uuid::new_v4(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // All three tasks were failed.
+        for task_id in orphan_tasks {
+            let status: String =
+                sqlx::query_scalar(r#"SELECT status FROM tasks WHERE task_id = $1"#)
+                    .bind(task_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(status, "failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_next_task_handler_returns_500_on_iteration_cap() {
+        // Pathological: insert MORE than MAX_ORPHAN_ITERATIONS (100) orphan
+        // tasks. The handler's safety bound must trip and return 500 with the
+        // "too many orphaned tasks" body. The test has to use the production
+        // cap because it's a private `const` inside the handler function.
+        let _guard = DataDirGuard::new();
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let now = Utc::now();
+
+        // Insert 101 orphans across 101 jobs — the cap is 100, so the 101st
+        // iteration is never reached and the handler returns 500 after
+        // failing the first 100. Using one job per orphan avoids any
+        // sibling-terminality side effects surprising the assertions.
+        for i in 0..101 {
+            let job_id = Uuid::new_v4();
+            insert_job_row(&pool, job_id, "processing").await;
+            let task_id = Uuid::new_v4();
+            insert_task_row_at(
+                &pool,
+                task_id,
+                job_id,
+                "pending",
+                0,
+                &["x"],
+                now - Duration::seconds(60 * (101 - i)),
+            )
+            .await;
+        }
+
+        let response = next_task_handler(
+            State(pool.clone()),
+            axum::Json(NextTaskRequest {
+                worker_id: Uuid::new_v4(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("too many orphaned tasks"),
+            "error body should mention the cap, got: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_task_handler_flips_job_to_failed_when_orphan_is_last_sibling() {
+        // Variant A: job has one Completed sibling and one orphaned task.
+        // After handler fails the orphan, sibling-terminality recompute sees
+        // >=1 Completed -> job stays `completed`.
+        //
+        // Variant B: job has two orphaned tasks. Handler fails both, so every
+        // sibling is Failed -> job flips to `failed`.
+        let guard = DataDirGuard::new();
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let now = Utc::now();
+
+        // ---- Variant A ---------------------------------------------------
+        //
+        // The completed sibling lives under a job whose files DO exist (so
+        // the sibling was submittable previously). The orphan task lives
+        // under the SAME job but was never actually dispatched; we still
+        // delete the job's data dir before the handler runs so the orphan
+        // path trips. That means the readable path from the OK sibling would
+        // ALSO fail here — but the sibling is already `completed`, so
+        // pick_next_task will never pick it.
+        let job_a = Uuid::new_v4();
+        insert_job_row(&pool, job_a, "processing").await;
+
+        let completed_sibling = Uuid::new_v4();
+        insert_task_row_at(
+            &pool,
+            completed_sibling,
+            job_a,
+            "completed",
+            1,
+            &["done"],
+            now - Duration::seconds(120),
+        )
+        .await;
+        // Attach a Submitted assignment to make the fixture realistic.
+        insert_assignment_row(
+            &pool,
+            Uuid::new_v4(),
+            completed_sibling,
+            Uuid::new_v4(),
+            now - Duration::seconds(90),
+            now - Duration::seconds(30),
+            "submitted",
+        )
+        .await;
+
+        let orphan_a = Uuid::new_v4();
+        insert_task_row_at(
+            &pool,
+            orphan_a,
+            job_a,
+            "pending",
+            0,
+            &["orphan"],
+            now - Duration::seconds(60),
+        )
+        .await;
+
+        // Ensure job_a has NO files on disk — orphan path must trip.
+        assert!(!guard.path().join(job_a.to_string()).exists());
+
+        let response = next_task_handler(
+            State(pool.clone()),
+            axum::Json(NextTaskRequest {
+                worker_id: Uuid::new_v4(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // Orphan was failed; job stays `completed` (>=1 Completed sibling).
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                r#"SELECT status FROM tasks WHERE task_id = $1"#
+            )
+            .bind(orphan_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                r#"SELECT status FROM jobs WHERE job_id = $1"#
+            )
+            .bind(job_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "completed"
+        );
+
+        // ---- Variant B ---------------------------------------------------
+        //
+        // All-orphan job: two pending tasks under a job with no files.
+        // Handler fails both, job flips to `failed`.
+        let job_b = Uuid::new_v4();
+        insert_job_row(&pool, job_b, "processing").await;
+        let orphan_b1 = Uuid::new_v4();
+        insert_task_row_at(
+            &pool,
+            orphan_b1,
+            job_b,
+            "pending",
+            0,
+            &["o1"],
+            now - Duration::seconds(40),
+        )
+        .await;
+        let orphan_b2 = Uuid::new_v4();
+        insert_task_row_at(
+            &pool,
+            orphan_b2,
+            job_b,
+            "pending",
+            0,
+            &["o2"],
+            now - Duration::seconds(30),
+        )
+        .await;
+
+        let response = next_task_handler(
+            State(pool.clone()),
+            axum::Json(NextTaskRequest {
+                worker_id: Uuid::new_v4(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // Both orphans Failed, job_b flipped to `failed`.
+        for t in [orphan_b1, orphan_b2] {
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    r#"SELECT status FROM tasks WHERE task_id = $1"#
+                )
+                .bind(t)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                "failed"
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                r#"SELECT status FROM jobs WHERE job_id = $1"#
+            )
+            .bind(job_b)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "failed"
+        );
     }
 }

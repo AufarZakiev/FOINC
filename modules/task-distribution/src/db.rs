@@ -262,6 +262,21 @@ pub enum JobTerminal {
     Failed,
 }
 
+/// Outcome of a sibling-terminality recompute. Returned by `fail_task` and
+/// used by orphan-recovery callers that want to know whether their action
+/// ended the job. Defined at module scope so it can be shared across db
+/// helpers; kept distinct from `JobTerminal` to preserve `submit_task`'s
+/// existing API shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobTerminalState {
+    /// Siblings are not all terminal yet; job is still `processing`.
+    StillProcessing,
+    /// All siblings terminal, ≥1 Completed — job flipped to `completed`.
+    FlippedCompleted,
+    /// All siblings terminal, none Completed — job flipped to `failed`.
+    FlippedFailed,
+}
+
 /// Persist a submission for the task, then recompute parent job terminality.
 pub async fn submit_task(
     pool: &PgPool,
@@ -392,6 +407,106 @@ struct CurrentAssignmentRow {
 struct SiblingCounts {
     non_terminal: i64,
     completed: i64,
+}
+
+/// Mark an orphaned task `Failed`.
+///
+/// Used by the orphan-recovery path in `POST /tasks/next` when the job's
+/// script or CSV cannot be read from disk. In a single transaction:
+///
+/// 1. Look up the task's parent `job_id` (needed for the sibling recompute).
+/// 2. Mark the current in-flight assignment `TimedOut`.
+/// 3. Mark the task `Failed`. `attempts` is NOT incremented — orphaned
+///    files are unrecoverable, not a retry.
+/// 4. Recompute sibling terminality using the same rule as `submit_task`:
+///    if every sibling is terminal (`Completed` or `Failed`), flip the job
+///    to `completed` (≥1 `Completed`) or `failed` (all `Failed`).
+///
+/// The returned [`JobTerminalState`] tells the caller whether the job
+/// flipped, so the handler can log or emit a signal. The CAS on
+/// `UPDATE jobs ... WHERE status='processing'` mirrors `submit_task` and
+/// keeps this path idempotent if another writer already flipped the job.
+pub async fn fail_task(
+    pool: &PgPool,
+    task_id: Uuid,
+) -> Result<JobTerminalState, sqlx::Error> {
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+
+    // 1. Look up parent job_id.
+    let job_id: Uuid =
+        sqlx::query_scalar(r#"SELECT job_id FROM tasks WHERE task_id = $1"#)
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    // 2. Mark the current in-flight assignment TimedOut. We target the most
+    //    recent in-flight row by `assigned_at DESC` — matches the locking
+    //    order used by `submit_task`. If there is no in-flight assignment
+    //    (defensive: task is assigned but the row went missing somehow), we
+    //    still proceed to fail the task.
+    sqlx::query(
+        r#"
+        UPDATE assignments
+           SET status = 'timed_out'
+         WHERE assignment_id = (
+                SELECT assignment_id
+                  FROM assignments
+                 WHERE task_id = $1
+                   AND status = 'in_flight'
+                 ORDER BY assigned_at DESC
+                 LIMIT 1
+         )
+        "#,
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // 3. Fail the task. Do NOT touch `attempts`.
+    sqlx::query(r#"UPDATE tasks SET status = 'failed' WHERE task_id = $1"#)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // 4. Recompute sibling terminality — identical rule to submit_task.
+    let sibling_counts = sqlx::query_as::<_, SiblingCounts>(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE status NOT IN ('completed', 'failed')) AS non_terminal,
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed
+          FROM tasks
+         WHERE job_id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let outcome = if sibling_counts.non_terminal == 0 {
+        if sibling_counts.completed > 0 {
+            sqlx::query(
+                r#"UPDATE jobs SET status = 'completed' WHERE job_id = $1 AND status = 'processing'"#,
+            )
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+            JobTerminalState::FlippedCompleted
+        } else {
+            sqlx::query(
+                r#"UPDATE jobs SET status = 'failed' WHERE job_id = $1 AND status = 'processing'"#,
+            )
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+            JobTerminalState::FlippedFailed
+        }
+    } else {
+        JobTerminalState::StillProcessing
+    };
+
+    tx.commit().await?;
+
+    Ok(outcome)
 }
 
 /// Check whether a job row exists.
@@ -1268,5 +1383,279 @@ mod tests {
         assert!(job_exists(&pool, job_id).await.unwrap());
 
         assert!(!job_exists(&pool, Uuid::new_v4()).await.unwrap());
+    }
+
+    // -------------------------------------------------------------------
+    // fail_task
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_fail_task_marks_task_failed_and_assignment_timed_out() {
+        // Orphan-recovery path: a task with a live InFlight assignment is
+        // failed. The assignment must transition InFlight -> TimedOut in the
+        // same tx that flips the task to Failed.
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let job_id = Uuid::new_v4();
+        insert_job_row(&pool, job_id, "processing").await;
+
+        let task_id = Uuid::new_v4();
+        insert_task_row(&pool, task_id, job_id, "assigned", 1, &["orphan"]).await;
+
+        let assignment_id = Uuid::new_v4();
+        let now = Utc::now();
+        insert_assignment_row(
+            &pool,
+            assignment_id,
+            task_id,
+            Uuid::new_v4(),
+            now,
+            now + Duration::seconds(60),
+            "in_flight",
+        )
+        .await;
+
+        let outcome = fail_task(&pool, task_id).await.unwrap();
+        // Single task, no completed siblings -> job flipped to failed.
+        assert_eq!(outcome, JobTerminalState::FlippedFailed);
+
+        let (status, _) = get_task_status_and_attempts(&pool, task_id).await;
+        assert_eq!(status, "failed");
+        assert_eq!(get_assignment_status(&pool, assignment_id).await, "timed_out");
+    }
+
+    #[tokio::test]
+    async fn test_fail_task_does_not_increment_attempts() {
+        // Orphaned files are unrecoverable and must NOT count as a retry.
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let job_id = Uuid::new_v4();
+        insert_job_row(&pool, job_id, "processing").await;
+
+        let task_id = Uuid::new_v4();
+        // Pre-set attempts=3 so we can observe it stays at 3 after fail_task.
+        insert_task_row(&pool, task_id, job_id, "assigned", 3, &["orphan"]).await;
+
+        let assignment_id = Uuid::new_v4();
+        let now = Utc::now();
+        insert_assignment_row(
+            &pool,
+            assignment_id,
+            task_id,
+            Uuid::new_v4(),
+            now,
+            now + Duration::seconds(60),
+            "in_flight",
+        )
+        .await;
+
+        let _ = fail_task(&pool, task_id).await.unwrap();
+
+        let (status, attempts) = get_task_status_and_attempts(&pool, task_id).await;
+        assert_eq!(status, "failed");
+        assert_eq!(attempts, 3, "fail_task must not touch attempts");
+    }
+
+    #[tokio::test]
+    async fn test_fail_task_returns_still_processing_when_siblings_outstanding() {
+        // Two tasks in the job. Failing one still leaves a Pending sibling,
+        // so the job stays in `processing`.
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let job_id = Uuid::new_v4();
+        insert_job_row(&pool, job_id, "processing").await;
+
+        // Sibling remains Pending — job must stay Processing.
+        let pending_sibling = Uuid::new_v4();
+        insert_task_row(&pool, pending_sibling, job_id, "pending", 0, &["live"]).await;
+
+        // The task we orphan-fail.
+        let task_id = Uuid::new_v4();
+        insert_task_row(&pool, task_id, job_id, "assigned", 0, &["orphan"]).await;
+        let assignment_id = Uuid::new_v4();
+        let now = Utc::now();
+        insert_assignment_row(
+            &pool,
+            assignment_id,
+            task_id,
+            Uuid::new_v4(),
+            now,
+            now + Duration::seconds(60),
+            "in_flight",
+        )
+        .await;
+
+        let outcome = fail_task(&pool, task_id).await.unwrap();
+        assert_eq!(outcome, JobTerminalState::StillProcessing);
+
+        assert_eq!(get_task_status_and_attempts(&pool, task_id).await.0, "failed");
+        assert_eq!(get_assignment_status(&pool, assignment_id).await, "timed_out");
+        assert_eq!(get_job_status(&pool, job_id).await, "processing");
+    }
+
+    #[tokio::test]
+    async fn test_fail_task_flips_job_to_failed_when_all_failed() {
+        // Two tasks, both orphaned in sequence. Last call flips job to failed.
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let job_id = Uuid::new_v4();
+        insert_job_row(&pool, job_id, "processing").await;
+
+        let t1 = Uuid::new_v4();
+        insert_task_row(&pool, t1, job_id, "assigned", 0, &["a"]).await;
+        let a1 = Uuid::new_v4();
+        let now = Utc::now();
+        insert_assignment_row(
+            &pool,
+            a1,
+            t1,
+            Uuid::new_v4(),
+            now,
+            now + Duration::seconds(60),
+            "in_flight",
+        )
+        .await;
+
+        let t2 = Uuid::new_v4();
+        insert_task_row(&pool, t2, job_id, "assigned", 0, &["b"]).await;
+        let a2 = Uuid::new_v4();
+        insert_assignment_row(
+            &pool,
+            a2,
+            t2,
+            Uuid::new_v4(),
+            now,
+            now + Duration::seconds(60),
+            "in_flight",
+        )
+        .await;
+
+        // First fail: sibling still Assigned -> StillProcessing.
+        let out1 = fail_task(&pool, t1).await.unwrap();
+        assert_eq!(out1, JobTerminalState::StillProcessing);
+        assert_eq!(get_job_status(&pool, job_id).await, "processing");
+
+        // Second fail: all siblings terminal, none Completed -> FlippedFailed.
+        let out2 = fail_task(&pool, t2).await.unwrap();
+        assert_eq!(out2, JobTerminalState::FlippedFailed);
+        assert_eq!(get_job_status(&pool, job_id).await, "failed");
+
+        assert_eq!(get_assignment_status(&pool, a1).await, "timed_out");
+        assert_eq!(get_assignment_status(&pool, a2).await, "timed_out");
+    }
+
+    #[tokio::test]
+    async fn test_fail_task_flips_job_to_completed_when_last_sibling_completed() {
+        // Two tasks. One submits successfully (via submit_task), then the
+        // other orphan-fails. After the fail, every sibling is terminal and
+        // >=1 Completed -> job should be Completed.
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let job_id = Uuid::new_v4();
+        insert_job_row(&pool, job_id, "processing").await;
+
+        // The task that will succeed via submit_task.
+        let ok_task = Uuid::new_v4();
+        insert_task_row(&pool, ok_task, job_id, "assigned", 0, &["ok"]).await;
+        let ok_assignment = Uuid::new_v4();
+        let ok_worker = Uuid::new_v4();
+        let now = Utc::now();
+        insert_assignment_row(
+            &pool,
+            ok_assignment,
+            ok_task,
+            ok_worker,
+            now,
+            now + Duration::seconds(60),
+            "in_flight",
+        )
+        .await;
+
+        // The task we will orphan-fail.
+        let orphan_task = Uuid::new_v4();
+        insert_task_row(&pool, orphan_task, job_id, "assigned", 0, &["orphan"]).await;
+        let orphan_assignment = Uuid::new_v4();
+        insert_assignment_row(
+            &pool,
+            orphan_assignment,
+            orphan_task,
+            Uuid::new_v4(),
+            now,
+            now + Duration::seconds(60),
+            "in_flight",
+        )
+        .await;
+
+        // Submit the OK task first — sibling (orphan_task) still Assigned, so
+        // the job stays in `processing`.
+        let submit_outcome =
+            submit_task(&pool, ok_task, ok_worker, "out", "err", 1.0)
+                .await
+                .unwrap();
+        assert_eq!(
+            submit_outcome,
+            SubmitOutcome::Submitted { job_terminal: None }
+        );
+        assert_eq!(get_job_status(&pool, job_id).await, "processing");
+
+        // Now orphan-fail the other task. All siblings terminal, >=1 Completed
+        // -> FlippedCompleted.
+        let fail_outcome = fail_task(&pool, orphan_task).await.unwrap();
+        assert_eq!(fail_outcome, JobTerminalState::FlippedCompleted);
+        assert_eq!(get_job_status(&pool, job_id).await, "completed");
+
+        assert_eq!(get_task_status_and_attempts(&pool, orphan_task).await.0, "failed");
+        assert_eq!(get_assignment_status(&pool, orphan_assignment).await, "timed_out");
+    }
+
+    #[tokio::test]
+    async fn test_fail_task_is_idempotent_with_no_inflight_assignment() {
+        // Defensive: fail_task must not crash when there is no InFlight
+        // assignment (e.g., only a TimedOut row exists, or no row at all).
+        // It should still flip the task to Failed and leave other assignment
+        // rows unchanged.
+        let Some((pool, _guard)) = pool_or_skip().await else {
+            return;
+        };
+
+        let job_id = Uuid::new_v4();
+        insert_job_row(&pool, job_id, "processing").await;
+
+        let task_id = Uuid::new_v4();
+        // Task has attempts=2 but no InFlight assignment — only a TimedOut.
+        insert_task_row(&pool, task_id, job_id, "assigned", 2, &["weird"]).await;
+        let old = Uuid::new_v4();
+        let now = Utc::now();
+        insert_assignment_row(
+            &pool,
+            old,
+            task_id,
+            Uuid::new_v4(),
+            now - Duration::seconds(300),
+            now - Duration::seconds(240),
+            "timed_out",
+        )
+        .await;
+
+        let outcome = fail_task(&pool, task_id).await.unwrap();
+        // Single task in job, no Completed siblings -> job flips to Failed.
+        assert_eq!(outcome, JobTerminalState::FlippedFailed);
+
+        let (status, attempts) = get_task_status_and_attempts(&pool, task_id).await;
+        assert_eq!(status, "failed");
+        // Attempts unchanged.
+        assert_eq!(attempts, 2);
+        // Existing TimedOut row untouched.
+        assert_eq!(get_assignment_status(&pool, old).await, "timed_out");
     }
 }

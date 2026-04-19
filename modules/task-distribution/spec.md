@@ -18,6 +18,7 @@ Split an uploaded job's CSV into per-row tasks, dispatch them to browser-based v
 | `Assigned` | Matching `POST /tasks/{id}/submit` received in time | `Completed` | Mark assignment `Submitted`; store stdout/stderr/duration_ms. Recompute parent Job terminality (see `/submit` side effects). |
 | `Assigned` | `POST /tasks/next` sees `deadline_at < now()` AND `attempts < 5` | `Pending` | Increment `attempts`, mark old assignment `TimedOut`. Eligible for redispatch in the same transaction. |
 | `Assigned` | `POST /tasks/next` sees `deadline_at < now()` AND `attempts >= 5` | `Failed` | Check is evaluated BEFORE incrementing: if already at 5, mark assignment `TimedOut`, mark task `Failed`, do NOT redispatch. Handler loops for another candidate. |
+| `Assigned` | Script/CSV files missing at dispatch | `Failed` | Mark current in-flight assignment `TimedOut`; mark task `Failed`; `attempts` is NOT incremented (unrecoverable, not a retry). Handler loops for another candidate. |
 
 Reclamation is lazy: only the next `POST /tasks/next` notices a missed deadline.
 
@@ -87,13 +88,15 @@ Atomically pick the next available task for the calling worker.
 
 **Request body** matches `NextTaskRequest`. **Response `200 OK`** matches `TaskDispatch`; **`204 No Content`** if nothing eligible. **Errors:** `500` (DB failure).
 
-**Side effects (single DB transaction)**
+**Side effects (single DB transaction per pick attempt; handler may loop across multiple transactions)**
 
 1. Candidate query uses `SELECT ... FOR UPDATE SKIP LOCKED` on the `tasks` row (not the query result) so concurrent pickers never contend on the same task. Candidates are tasks where `status = Pending`, OR `status = Assigned` with the current `InFlight` assignment's `deadline_at < now()` (joined via a LATERAL / correlated subquery over `assignments`). Acquiring the task-row lock serializes the "mark old assignment `TimedOut` + create new assignment" sequence.
 2. If the candidate was a timed-out `Assigned`: evaluate `attempts >= 5` FIRST. If true, mark old assignment `TimedOut`, mark task `Failed`, commit, and loop back to step 1 for another candidate. Otherwise increment `attempts`, mark old assignment `TimedOut`, and continue.
-3. Insert new `Assignment` (`InFlight`, `assigned_at = now()`, `deadline_at = now() + 60s`, `worker_id` from request). Set `tasks.status = Assigned`.
-4. Read parent job's `script` from disk (`data/{job_id}/*.py`).
-5. Commit, return `TaskDispatch`. If no candidate remains after loops, return `204`.
+3. Insert new `Assignment` (`InFlight`, `assigned_at = now()`, `deadline_at = now() + 60s`, `worker_id` from request). Set `tasks.status = Assigned`. Commit the pick transaction.
+4. **Orphan-recovery step (post-commit).** Attempt to read the parent job's script (`data/{job_id}/*.py`) and CSV (`data/{job_id}/*.csv`) from disk. On success, build the `TaskDispatch` and proceed to return 200. On failure (ENOENT, permission, any IO error), invoke `fail_task(pool, task_id)`: it marks the current in-flight assignment `TimedOut` and the task `Failed` in a single transaction without incrementing `attempts`, then recomputes the job's sibling terminality — if all sibling tasks are terminal (`Completed` or `Failed`), flip `jobs.status` to `completed` (if ≥1 `Completed`) or `failed` (all `Failed`). Then loop back to step 1 for another candidate.
+5. The loop exits when a readable task is found (return `200` with `TaskDispatch`) or no further candidate is available (return `204`).
+
+**Note on Job terminality.** This endpoint may now flip `jobs.status` out of `processing` via the orphan-recovery path in step 4. This relaxes the previously documented "only `POST /tasks/{id}/submit` flips the Job" invariant: both `/submit` and `/next` (orphan-fail path) can trigger the sibling-terminality recompute and the resulting Job transition. The recompute rule itself is unchanged — see `/submit` side effects.
 
 ---
 
@@ -111,7 +114,7 @@ Submit the result of an in-flight task.
    - at least one `Completed` → `UPDATE jobs SET status='completed'`;
    - zero `Completed` (all `Failed`) → `UPDATE jobs SET status='failed'`.
 
-This is the only path that flips Job out of `processing`. The transition `processing → failed` is added to `JobStatus`.
+`/submit` is one of two paths that flips Job out of `processing`; the other is the orphan-recovery path in `POST /tasks/next` (see that endpoint's step 4). Both paths apply the same sibling-terminality rule. The transition `processing → failed` is added to `JobStatus`.
 
 ---
 
@@ -130,6 +133,18 @@ Return current dispatch statistics. **Query:** `job_id: UUID` (required), `worke
 
 1. `SELECT 1 FROM jobs WHERE id = ?`. If missing, return `404`.
 2. Otherwise compute the four counts above and return them.
+
+---
+
+### Internal functions
+
+| Function | Signature | Description | Errors |
+|----------|-----------|-------------|--------|
+| `pick_next_task` | `(pool: &PgPool, worker_id: Uuid) -> Result<Option<(Uuid, Uuid, Vec<String>, DateTime<Utc>)>, sqlx::Error>` | Single-transaction candidate pick described in `POST /tasks/next` steps 1-3. Returns `(task_id, job_id, input_rows, deadline_at)` on pick, `None` when no candidate remains. Does NOT read files — file IO is the handler's responsibility. | `sqlx::Error` |
+| `submit_task` | `(pool: &PgPool, task_id: Uuid, req: &SubmitTaskRequest) -> Result<JobTerminalState, SubmitError>` | Locks the current assignment, validates `worker_id` / deadline / state, marks assignment `Submitted` and task `Completed`, and recomputes sibling terminality per `/submit` side effects. Returns whether the Job flipped to a terminal state. | `SubmitError::NotFound`, `SubmitError::Conflict`, `sqlx::Error` |
+| `fail_task` | `(pool: &PgPool, task_id: Uuid) -> Result<JobTerminalState, sqlx::Error>` | Marks the task's current in-flight assignment `TimedOut` and the task `Failed` under a single transaction. Does NOT increment `attempts` (orphaned files are unrecoverable). Recomputes sibling terminality using the same rule as `submit_task`: if all sibling tasks are terminal, flips Job to `completed` (≥1 `Completed`) or `failed` (all `Failed`). Returns whether the Job flipped. Used by the orphan-recovery path in the `POST /tasks/next` handler. | `sqlx::Error` |
+
+`JobTerminalState` is a module-internal enum with variants `StillProcessing`, `FlippedCompleted`, and `FlippedFailed`.
 
 ---
 
