@@ -1,19 +1,17 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { uploadFiles } from "./api";
-import type { Job } from "../../../integrations/ui/types";
 import type { UploadCompleted } from "../../../integrations/ui/events";
-import UploadStatus from "./UploadStatus.vue";
+import type { Toast } from "../../../integrations/ui/notifications";
 
 const emit = defineEmits<{
   uploaded: [payload: UploadCompleted];
+  notify: [payload: Toast];
 }>();
 
 const csvFile = ref<File | null>(null);
 const scriptFile = ref<File | null>(null);
 const loading = ref(false);
-const job = ref<Job | null>(null);
-const error = ref<string | null>(null);
 const dragOver = ref(false);
 
 const csvInput = ref<HTMLInputElement | null>(null);
@@ -23,16 +21,19 @@ function validateExtension(file: File, expected: string): boolean {
   return file.name.toLowerCase().endsWith(expected);
 }
 
+function notifyError(message: string) {
+  emit("notify", { level: "error", message });
+}
+
 function handleCsvSelect(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0] ?? null;
   if (file && !validateExtension(file, ".csv")) {
-    error.value = `Invalid file: "${file.name}". Expected a .csv file.`;
+    notifyError(`Invalid file: "${file.name}". Expected a .csv file.`);
     csvFile.value = null;
     input.value = "";
     return;
   }
-  error.value = null;
   csvFile.value = file;
 }
 
@@ -40,12 +41,11 @@ function handleScriptSelect(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0] ?? null;
   if (file && !validateExtension(file, ".py")) {
-    error.value = `Invalid file: "${file.name}". Expected a .py file.`;
+    notifyError(`Invalid file: "${file.name}". Expected a .py file.`);
     scriptFile.value = null;
     input.value = "";
     return;
   }
-  error.value = null;
   scriptFile.value = file;
 }
 
@@ -62,7 +62,6 @@ function handleDrop(event: DragEvent) {
       scriptFile.value = file;
     }
   }
-  error.value = null;
 }
 
 function handleDragOver() {
@@ -77,8 +76,6 @@ async function handleSubmit() {
   if (!csvFile.value || !scriptFile.value) return;
 
   loading.value = true;
-  job.value = null;
-  error.value = null;
 
   try {
     const uploadedJob = await uploadFiles(csvFile.value, scriptFile.value);
@@ -86,14 +83,14 @@ async function handleSubmit() {
       scriptFile.value.text(),
       csvFile.value.text(),
     ]);
-    job.value = uploadedJob;
     emit("uploaded", {
       jobId: uploadedJob.job_id,
       script,
       csv,
     });
   } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : "Upload failed";
+    const message = e instanceof Error ? e.message : "Upload failed";
+    notifyError(message);
   } finally {
     loading.value = false;
   }
@@ -102,8 +99,6 @@ async function handleSubmit() {
 function reset() {
   csvFile.value = null;
   scriptFile.value = null;
-  job.value = null;
-  error.value = null;
   loading.value = false;
   if (csvInput.value) csvInput.value.value = "";
   if (scriptInput.value) scriptInput.value.value = "";
@@ -168,9 +163,11 @@ function reset() {
       >
         Reset
       </button>
+      <div v-if="loading" class="loading-indicator" role="status" aria-live="polite">
+        <span class="spinner" aria-hidden="true"></span>
+        <span>Uploading...</span>
+      </div>
     </div>
-
-    <UploadStatus :loading="loading" :job="job" :error="error" />
   </div>
 </template>
 
@@ -244,6 +241,31 @@ function reset() {
 .actions {
   display: flex;
   gap: 0.75rem;
+  align-items: center;
+}
+
+.loading-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #555;
+  font-size: 0.9rem;
+}
+
+.spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #ccc;
+  border-top-color: #3b82f6;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .btn {

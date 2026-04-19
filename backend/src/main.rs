@@ -1,4 +1,4 @@
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
@@ -22,6 +22,7 @@ async fn main() {
     let app = Router::new()
         .route("/upload", post(foinc_upload::upload_handler))
         .route("/jobs/{id}", get(foinc_upload::get_job_handler))
+        .route("/jobs/{id}", delete(foinc_upload::delete_job_handler))
         .layer(cors)
         .with_state(pool);
 

@@ -42,11 +42,8 @@ pub async fn cleanup_files(job_id: Uuid) -> Result<(), io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    /// Guard to serialize storage tests that mutate the DATA_DIR env var.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// RAII guard that sets DATA_DIR to a unique temp directory on creation
     /// and cleans up (removes the env var + deletes the temp directory) on drop.
@@ -58,7 +55,9 @@ mod tests {
 
     impl DataDirGuard {
         fn new() -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
+            // Recover from a poisoned lock — a previous test panic poisons
+            // the Mutex, but no protected data is actually shared.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!("foinc_test_{}", Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             std::env::set_var("DATA_DIR", dir.to_str().unwrap());
@@ -213,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_files_unwritable_base_dir_returns_error() {
-        let lock = ENV_LOCK.lock().unwrap();
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Point DATA_DIR to a path that cannot be created.
         // On both Windows and Unix, a path rooted under a non-existent device/drive
         // or deeply nested under a file (not dir) will fail.
