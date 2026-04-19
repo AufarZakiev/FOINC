@@ -10,4 +10,4 @@ frontend/.vite/
 data/
 
 # Personal scratch
-examples/
+examples/add.py
