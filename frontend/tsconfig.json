@@ -10,7 +10,6 @@
     "noEmit": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "baseUrl": ".",
     "paths": {
       "vue": ["./node_modules/vue"],
       "@/*": ["./src/*"],
@@ -24,6 +23,8 @@
     "../modules/upload/ui/**/*.ts",
     "../modules/pyodide-runtime/ui/**/*.vue",
     "../modules/pyodide-runtime/ui/**/*.ts",
+    "../modules/task-distribution/ui/**/*.vue",
+    "../modules/task-distribution/ui/**/*.ts",
     "../integrations/ui/**/*.ts"
   ],
   "exclude": ["../modules/**/ui/__tests__/**"],

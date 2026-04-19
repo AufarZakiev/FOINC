@@ -1,16 +1,41 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import UploadForm from "../../modules/upload/ui/UploadForm.vue";
 import DryRunPanel from "../../modules/pyodide-runtime/ui/DryRunPanel.vue";
+import StartJobButton from "../../modules/task-distribution/ui/StartJobButton.vue";
 import { deleteJob } from "../../modules/upload/ui/api";
-import type { UploadCompleted } from "../../integrations/ui/events";
+import type {
+  JobStarted,
+  UploadCompleted,
+} from "../../integrations/ui/events";
 import type { Toast } from "../../integrations/ui/notifications";
 import ToastContainer from "./ToastContainer.vue";
+import VolunteerView from "./VolunteerView.vue";
 
 type ToastWithId = Toast & { id: number };
+type Route = "scientist" | "volunteer";
+
+function routeFromHash(): Route {
+  return window.location.hash === "#/volunteer" ? "volunteer" : "scientist";
+}
+
+const route = ref<Route>(routeFromHash());
+
+function onHashChange() {
+  route.value = routeFromHash();
+}
+
+onMounted(() => {
+  window.addEventListener("hashchange", onHashChange);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("hashchange", onHashChange);
+});
 
 const step = ref<1 | 2>(1);
 const upload = ref<UploadCompleted | null>(null);
+const startedJob = ref<JobStarted | null>(null);
 const toasts = ref<ToastWithId[]>([]);
 
 let nextToastId = 1;
@@ -25,30 +50,50 @@ function removeToast(id: number) {
 
 function onUploaded(payload: UploadCompleted) {
   upload.value = payload;
+  startedJob.value = null;
   step.value = 2;
 }
 
+function onJobStarted(payload: JobStarted) {
+  startedJob.value = payload;
+}
+
 async function onBack() {
-  const current = upload.value;
-  if (current !== null) {
-    try {
-      await deleteJob(current.jobId);
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to delete job.";
-      pushToast({ level: "error", message, durationMs: 0 });
+  // If a job has already been started, don't try to delete — it's in processing.
+  // Just reset local wizard state.
+  if (startedJob.value === null) {
+    const current = upload.value;
+    if (current !== null) {
+      try {
+        await deleteJob(current.jobId);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to delete job.";
+        pushToast({ level: "error", message, durationMs: 0 });
+      }
     }
   }
   upload.value = null;
+  startedJob.value = null;
   step.value = 1;
 }
+
+const taskCountLabel = computed(() =>
+  startedJob.value === null
+    ? ""
+    : startedJob.value.taskCount === 1
+      ? "1 task queued"
+      : `${startedJob.value.taskCount} tasks queued`,
+);
 </script>
 
 <template>
-  <div class="app">
+  <VolunteerView v-if="route === 'volunteer'" />
+  <div v-else class="app">
     <header class="app-header">
       <h1>FOINC</h1>
       <p>Distributed Volunteer Computing Platform</p>
+      <a class="nav-link" href="#/volunteer">Volunteer &rarr;</a>
     </header>
 
     <nav class="stepper" aria-label="Wizard progress">
@@ -60,7 +105,9 @@ async function onBack() {
         }"
         :aria-current="step === 1 ? 'step' : undefined"
       >
-        <span v-if="step === 2" class="pill__check" aria-hidden="true">&#10003;</span>
+        <span v-if="step === 2" class="pill__check" aria-hidden="true"
+          >&#10003;</span
+        >
         1 &middot; Upload
       </span>
       <span
@@ -76,12 +123,31 @@ async function onBack() {
     </nav>
 
     <main class="app-main">
-      <UploadForm v-if="step === 1" @uploaded="onUploaded" @notify="pushToast" />
+      <UploadForm
+        v-if="step === 1"
+        @uploaded="onUploaded"
+        @notify="pushToast"
+      />
       <template v-else-if="step === 2 && upload">
-        <DryRunPanel :upload="upload" @notify="pushToast" />
-        <button type="button" class="back-button" @click="onBack">
-          Back
-        </button>
+        <template v-if="startedJob === null">
+          <DryRunPanel :upload="upload" @notify="pushToast" />
+          <StartJobButton
+            :upload="upload"
+            @started="onJobStarted"
+            @notify="pushToast"
+          />
+        </template>
+        <section v-else class="job-confirmation" role="status">
+          <h2 class="job-confirmation__title">Job started</h2>
+          <p class="job-confirmation__body">
+            {{ taskCountLabel }}.
+            <a class="job-confirmation__link" href="#/volunteer"
+              >Open the volunteer page</a
+            >
+            to help run them.
+          </p>
+        </section>
+        <button type="button" class="back-button" @click="onBack">Back</button>
       </template>
     </main>
 
@@ -109,9 +175,21 @@ async function onBack() {
 }
 
 .app-header p {
-  margin: 0;
+  margin: 0 0 0.5rem;
   color: #666;
   font-size: 0.95rem;
+}
+
+.nav-link {
+  display: inline-block;
+  margin-top: 0.25rem;
+  font-size: 0.875rem;
+  color: #1565c0;
+  text-decoration: none;
+}
+
+.nav-link:hover {
+  text-decoration: underline;
 }
 
 .stepper {
@@ -166,6 +244,34 @@ async function onBack() {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
+}
+
+.job-confirmation {
+  border: 1px solid #a5d6a7;
+  background: #e8f5e9;
+  color: #1b5e20;
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+}
+
+.job-confirmation__title {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+
+.job-confirmation__body {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.job-confirmation__link {
+  color: #1565c0;
+  text-decoration: none;
+}
+
+.job-confirmation__link:hover {
+  text-decoration: underline;
 }
 
 .back-button {

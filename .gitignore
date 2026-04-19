@@ -4,6 +4,10 @@ target/
 # Node
 node_modules/
 frontend/dist/
+frontend/.vite/
 
 # Data
 data/
+
+# Personal scratch
+examples/add.py

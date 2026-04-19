@@ -23,6 +23,22 @@ async fn main() {
         .route("/upload", post(foinc_upload::upload_handler))
         .route("/jobs/{id}", get(foinc_upload::get_job_handler))
         .route("/jobs/{id}", delete(foinc_upload::delete_job_handler))
+        .route(
+            "/jobs/{id}/start",
+            post(foinc_task_distribution::start_job_handler),
+        )
+        .route(
+            "/tasks/next",
+            post(foinc_task_distribution::next_task_handler),
+        )
+        .route(
+            "/tasks/{id}/submit",
+            post(foinc_task_distribution::submit_task_handler),
+        )
+        .route(
+            "/tasks/stats",
+            get(foinc_task_distribution::task_stats_handler),
+        )
         .layer(cors)
         .with_state(pool);
 

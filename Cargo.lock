@@ -364,6 +364,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "foinc-integrations",
+ "foinc-task-distribution",
  "foinc-upload",
  "sqlx",
  "tokio",
@@ -378,6 +379,21 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "uuid",
+]
+
+[[package]]
+name = "foinc-task-distribution"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "foinc-integrations",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
  "uuid",
 ]
 

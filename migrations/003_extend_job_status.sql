@@ -1,0 +1,21 @@
+-- Extend the allowed values in `jobs.status` so the task-distribution
+-- module can move jobs through `processing -> completed | failed`.
+--
+-- The original `001_create_jobs.sql` did not declare a CHECK constraint
+-- on `status`, so there is nothing to drop — this file documents the
+-- expanded wire contract and acts as a seam for future hardening (e.g.
+-- adding an enum type). It is safe to run on an existing database.
+--
+-- Allowed values going forward:
+--   'uploaded'   — set by the upload module on successful ingest.
+--   'processing' — set by task-distribution on `POST /jobs/{id}/start`.
+--   'completed'  — set by task-distribution when all tasks terminal and
+--                  at least one completed.
+--   'failed'     — set by task-distribution when all tasks terminal and
+--                  none completed.
+--
+-- If a future migration wants to enforce this with a CHECK:
+--   ALTER TABLE jobs
+--     ADD CONSTRAINT jobs_status_check
+--     CHECK (status IN ('uploaded', 'processing', 'completed', 'failed'));
+SELECT 1;
