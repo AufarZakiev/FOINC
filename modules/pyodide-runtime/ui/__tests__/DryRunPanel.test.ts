@@ -169,9 +169,9 @@ describe("DryRunPanel.vue", () => {
     expect(wrapper.find("button.btn--primary").exists()).toBe(false);
   });
 
-  // ---- Error state --------------------------------------------------------
+  // ---- Error state: notify emission --------------------------------------
 
-  it("shows an error message from Error.message when dryRun rejects", async () => {
+  it("emits notify with error-level Toast when dryRun rejects", async () => {
     mockDryRun.mockRejectedValue(new Error("Pyodide load failed"));
 
     const upload = makeUpload();
@@ -180,13 +180,57 @@ describe("DryRunPanel.vue", () => {
     await wrapper.find("button.btn--primary").trigger("click");
     await flushPromises();
 
-    const err = wrapper.find(".status--error");
-    expect(err.exists()).toBe(true);
-    expect(err.text()).toBe("Pyodide load failed");
+    // Exactly one `notify` emission with an error-level Toast payload.
+    const emitted = wrapper.emitted("notify");
+    expect(emitted).toBeDefined();
+    expect(emitted).toHaveLength(1);
+    expect(emitted![0]).toEqual([
+      { level: "error", message: "Pyodide load failed" },
+    ]);
 
-    // Loading / results should not be visible.
+    // Reject path must NOT render the inline `.status--error`; the panel
+    // returns to the idle-button state.
+    expect(wrapper.find(".status--error").exists()).toBe(false);
+    expect(wrapper.find("button.btn--primary").exists()).toBe(true);
+
+    // Loading / results must not be visible either.
     expect(wrapper.find(".status--loading").exists()).toBe(false);
     expect(wrapper.findComponent(DryRunResults).exists()).toBe(false);
+  });
+
+  it("does NOT emit notify on successful dryRun", async () => {
+    mockDryRun.mockResolvedValue(sampleResult);
+
+    const upload = makeUpload();
+    const wrapper = mount(DryRunPanel, { props: { upload } });
+
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    // No `notify` should have fired at all on the success path.
+    expect(wrapper.emitted("notify")).toBeUndefined();
+
+    // Results should be rendered.
+    expect(wrapper.findComponent(DryRunResults).exists()).toBe(true);
+  });
+
+  it("returns to idle-button state after dryRun rejects", async () => {
+    mockDryRun.mockRejectedValue(new Error("boom"));
+
+    const upload = makeUpload();
+    const wrapper = mount(DryRunPanel, { props: { upload } });
+
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    // Loading gone, no inline error, no results, Run button visible.
+    expect(wrapper.find(".status--loading").exists()).toBe(false);
+    expect(wrapper.find(".status--error").exists()).toBe(false);
+    expect(wrapper.findComponent(DryRunResults).exists()).toBe(false);
+
+    const btn = wrapper.find("button.btn--primary");
+    expect(btn.exists()).toBe(true);
+    expect(btn.text()).toBe("Run dry run");
   });
 
   // ---- CSV parsing --------------------------------------------------------
@@ -305,36 +349,40 @@ describe("DryRunPanel.vue", () => {
 
   // ---- Reactivity: upload prop change ------------------------------------
 
-  it("resets error to null when the upload prop changes", async () => {
-    mockDryRun.mockRejectedValueOnce(new Error("first failure"));
+  it("does not surface a prior error on a new successful submit", async () => {
+    // First call rejects, second call resolves.
+    mockDryRun
+      .mockRejectedValueOnce(new Error("first failure"))
+      .mockResolvedValueOnce(sampleResult);
 
-    const upload1 = makeUpload({
+    const upload = makeUpload({
       jobId: "job-1",
       script: "print(1)",
       csv: "h\nr1",
     });
-    const wrapper = mount(DryRunPanel, { props: { upload: upload1 } });
+    const wrapper = mount(DryRunPanel, { props: { upload } });
 
+    // First submit: rejects.
     await wrapper.find("button.btn--primary").trigger("click");
     await flushPromises();
 
-    // Sanity: error is shown.
-    const err = wrapper.find(".status--error");
-    expect(err.exists()).toBe(true);
-    expect(err.text()).toBe("first failure");
-
-    // Change the prop to a new payload.
-    const upload2 = makeUpload({
-      jobId: "job-2",
-      script: "print(2)",
-      csv: "h\nr2",
-    });
-    await wrapper.setProps({ upload: upload2 });
-    await flushPromises();
-
-    // The prior error is gone; we're back to the idle Run-button state.
+    // Reject path emits `notify` but renders no inline error; idle again.
+    expect(wrapper.emitted("notify")).toBeDefined();
+    expect(wrapper.emitted("notify")).toHaveLength(1);
     expect(wrapper.find(".status--error").exists()).toBe(false);
     expect(wrapper.find("button.btn--primary").exists()).toBe(true);
+
+    // Second submit: resolves. Panel must render the successful
+    // `DryRunResults` with NO stale `.status--error` lingering.
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.findComponent(DryRunResults).exists()).toBe(true);
+    expect(wrapper.find(".status--error").exists()).toBe(false);
+    expect(wrapper.find(".status--loading").exists()).toBe(false);
+
+    // No extra `notify` emissions from the successful run.
+    expect(wrapper.emitted("notify")).toHaveLength(1);
   });
 
   it("resets result to null when the upload prop changes", async () => {
