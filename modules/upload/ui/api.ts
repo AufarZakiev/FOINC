@@ -21,3 +21,24 @@ export async function uploadFiles(csv: File, script: File): Promise<Job> {
 
   return response.json();
 }
+
+/**
+ * Delete a previously-uploaded job.
+ *
+ * Calls `DELETE /api/jobs/{id}` (proxied to backend `DELETE /jobs/{id}`).
+ * Resolves on `204 No Content`. Throws on any non-204 response (including
+ * 404 and 500) with a message extracted from the response body when
+ * available.
+ */
+export async function deleteJob(id: string): Promise<void> {
+  const response = await fetch(`/api/jobs/${id}`, {
+    method: "DELETE",
+  });
+
+  if (response.status === 204) {
+    return;
+  }
+
+  const body = await response.json().catch(() => ({ error: "Delete failed" }));
+  throw new Error(body.error ?? `Delete failed with status ${response.status}`);
+}

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
 import type { UploadCompleted } from "../../../integrations/ui/events";
+import type { Toast } from "../../../integrations/ui/notifications";
 import DryRunResults from "./DryRunResults.vue";
 import { dryRun, type DryRunResult } from "./dryRun";
 
@@ -8,8 +9,11 @@ const props = defineProps<{
   upload: UploadCompleted;
 }>();
 
+const emit = defineEmits<{
+  notify: [payload: Toast];
+}>();
+
 const loading = ref(false);
-const error = ref<string | null>(null);
 const result = ref<DryRunResult | null>(null);
 
 /**
@@ -34,7 +38,6 @@ const hasNoDataRows = computed(() => csvRows.value.length === 0);
 watch(
   () => props.upload,
   () => {
-    error.value = null;
     result.value = null;
   },
 );
@@ -42,13 +45,12 @@ watch(
 async function handleRun() {
   if (hasNoDataRows.value) return;
   loading.value = true;
-  error.value = null;
   result.value = null;
 
   try {
     result.value = await dryRun(props.upload.script, csvRows.value);
   } catch (e: unknown) {
-    error.value = (e as Error).message;
+    emit("notify", { level: "error", message: (e as Error).message });
   } finally {
     loading.value = false;
   }
@@ -63,7 +65,6 @@ async function handleRun() {
       CSV must contain at least 1 data row
     </p>
     <p v-else-if="loading" class="status status--loading">Running dry run...</p>
-    <p v-else-if="error" class="status status--error">{{ error }}</p>
     <DryRunResults v-else-if="result" :result="result" />
     <div v-else class="actions">
       <button type="button" class="btn btn--primary" @click="handleRun">

@@ -129,15 +129,15 @@ Displays the outcome of a dry run.
 `DryRunPanel.vue`
 Runs a dry run for an already-uploaded job and renders the outcome.
 - Props: `upload: UploadCompleted` (from `integrations/ui/events.ts`). Required.
-- Emits: none.
-- State: `loading: boolean`, `error: string | null`, `result: DryRunResult | null`.
+- Emits: `notify: [payload: Toast]` (`Toast` from `integrations/ui/notifications.ts`). Used to surface transient errors from `dryRun` rejections to the frontend shell's `ToastContainer`; the panel does not render toasts itself.
+- State: `loading: boolean`, `result: DryRunResult | null`. No local error state.
 - Data flow:
   1. From `upload.csv`, split on `\n`, trim each line, discard lines empty after trimming. Drop the first remaining line (CSV header). The next 1-3 lines become `csvRows`.
-  2. If parsing yields 0 rows, render an inline error `"CSV must contain at least 1 data row"` and do not call `dryRun`.
+  2. If parsing yields 0 rows, render an inline message `"CSV must contain at least 1 data row"` and do not call `dryRun`. This is a steady-state hint about the current `upload` prop (not a transient error), so it is rendered inline rather than emitted as a toast — it must remain visible until the prop changes to valid CSV.
   3. If parsing yields >3 rows, use only the first 3 (caller slice matches `dryRun`'s contract).
-  4. Render a "Run dry run" button. On click: set `loading=true`, call `dryRun(upload.script, csvRows)`; on resolve store `result` and render `DryRunResults`; on reject store `error.message` and render inline.
-- Only one of idle-button / loading / error / result is visible at a time.
-- When the `upload` prop changes to a new payload, reset `error` and `result` to `null`.
+  4. Render a "Run dry run" button. On click: set `loading=true`, call `dryRun(upload.script, csvRows)`; on resolve store `result` and render `DryRunResults`; on reject emit `notify` with `{ level: "error", message: error.message }` and do not store the error locally or render it inline. After either outcome, clear `loading`. After `loading` clears on reject, the panel returns to the idle-button state (no `result`, no local error).
+- Only one of idle-button / loading / result / csv-invalid-message is visible at a time. There is no inline error state.
+- When the `upload` prop changes to a new payload, reset `result` to `null`.
 
 ### Resource Limits
 
@@ -157,8 +157,7 @@ The Python environment has no access to:
 These are enforced by not providing the relevant Emscripten/Pyodide modules. Pyodide packages are loaded lazily on first `import` within a script (not eagerly at init).
 
 ## Non-goals
-- No file upload, file picker, or text input in UI — the module consumes an already-uploaded `UploadCompleted`; sourcing files is the upload module's responsibility.
-- No aggregation detection, persistent state between `exec` calls, or backend component — each execution is isolated and runs entirely in the browser.
-- No more than 3 rows per dry run, no partial results on failure, and no CSV-structured rendering of script output — stdout is shown as raw text in a `<pre>` block.
+- Module stays isolated: no file upload / picker / text input (upload module's job), no aggregation detection, no persistent state between `exec` calls, and no backend component — each execution runs entirely in the browser against an already-uploaded `UploadCompleted`.
+- Input/output simplifications: dry runs are capped at 3 rows with no partial results on failure; CSV parsing is not RFC 4180-compliant (commas are a hard separator, no quoting/escaping/embedded newlines); stdout is rendered as raw text in a `<pre>` block, not as CSV-structured output.
 - No mounting of `DryRunPanel` — composition and routing live in `frontend/`, not in this module.
-- No RFC 4180-compliant CSV parsing — commas are a hard field separator; quoted fields, escaped quotes, and embedded newlines are not recognized.
+- No inline toast rendering — the frontend shell owns `ToastContainer`; this module only emits `notify` events.

@@ -40,6 +40,18 @@ function makeFile(name: string, content: string): File {
 }
 
 /**
+ * Build a File stub whose `.text()` rejects with the given error. Used to
+ * simulate a local file-read failure without network involvement.
+ */
+function makeFileWithFailingText(name: string, err: Error): File {
+  const file = new File(["ignored"], name, { type: "text/plain" });
+  Object.defineProperty(file, "text", {
+    value: () => Promise.reject(err),
+  });
+  return file;
+}
+
+/**
  * Attach a file to an <input type="file"> and dispatch a change event so the
  * component's handler runs. jsdom does not allow assigning to `input.files`
  * directly, so we redefine the property.
@@ -67,7 +79,7 @@ const sampleJob: Job = {
 };
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests: uploaded event (success path)
 // ---------------------------------------------------------------------------
 
 describe("UploadForm.vue — uploaded event", () => {
@@ -173,6 +185,94 @@ describe("UploadForm.vue — uploaded event", () => {
     expect(payload.csv).toBe(csvSource);
   });
 
+  it("emits_uploaded_payload_matches_exact_file_contents", async () => {
+    mockUploadFiles.mockResolvedValue(sampleJob);
+
+    // Distinct contents in each file to guarantee no swap/reuse.
+    const scriptSource = "# SCRIPT_MARKER_9f2a\nprint('from script')\n";
+    const csvSource = "HEADER_MARKER_4b1c\nrow1,row2\n";
+
+    const wrapper = mount(UploadForm);
+    const inputs = wrapper.findAll('input[type="file"]');
+    await setInputFile(
+      inputs[0].element as HTMLInputElement,
+      makeFile("data.csv", csvSource),
+    );
+    await setInputFile(
+      inputs[1].element as HTMLInputElement,
+      makeFile("script.py", scriptSource),
+    );
+
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    const payload = wrapper.emitted("uploaded")![0][0] as {
+      jobId: string;
+      script: string;
+      csv: string;
+    };
+    expect(payload).toEqual({
+      jobId: sampleJob.job_id,
+      script: scriptSource,
+      csv: csvSource,
+    });
+  });
+
+  it("does_not_emit_notify_on_successful_upload", async () => {
+    mockUploadFiles.mockResolvedValue(sampleJob);
+
+    const wrapper = mount(UploadForm);
+    const inputs = wrapper.findAll('input[type="file"]');
+    await setInputFile(
+      inputs[0].element as HTMLInputElement,
+      makeFile("data.csv", "a,b\n1,2\n"),
+    );
+    await setInputFile(
+      inputs[1].element as HTMLInputElement,
+      makeFile("script.py", "print('hi')\n"),
+    );
+
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.emitted("notify")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: notify event + failure paths
+// ---------------------------------------------------------------------------
+
+describe("UploadForm.vue — notify event on failure", () => {
+  beforeEach(() => {
+    mockUploadFiles.mockReset();
+  });
+
+  it("emits_notify_with_error_level_and_message_when_upload_rejects", async () => {
+    mockUploadFiles.mockRejectedValue(new Error("network down"));
+
+    const wrapper = mount(UploadForm);
+    const inputs = wrapper.findAll('input[type="file"]');
+    await setInputFile(
+      inputs[0].element as HTMLInputElement,
+      makeFile("data.csv", "a,b\n1,2\n"),
+    );
+    await setInputFile(
+      inputs[1].element as HTMLInputElement,
+      makeFile("script.py", "print('hi')\n"),
+    );
+
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    const emissions = wrapper.emitted("notify");
+    expect(emissions).toBeDefined();
+    expect(emissions).toHaveLength(1);
+    const payload = emissions![0][0] as { level: string; message: string };
+    expect(payload.level).toBe("error");
+    expect(payload.message).toBe("network down");
+  });
+
   it("does_not_emit_uploaded_when_backend_upload_rejects", async () => {
     mockUploadFiles.mockRejectedValue(new Error("network down"));
 
@@ -193,8 +293,34 @@ describe("UploadForm.vue — uploaded event", () => {
     expect(wrapper.emitted("uploaded")).toBeUndefined();
   });
 
-  it("shows_error_message_when_backend_upload_rejects", async () => {
-    mockUploadFiles.mockRejectedValue(new Error("network down"));
+  it("emits_notify_with_error_when_file_read_fails", async () => {
+    mockUploadFiles.mockResolvedValue(sampleJob);
+
+    const wrapper = mount(UploadForm);
+    const inputs = wrapper.findAll('input[type="file"]');
+    await setInputFile(
+      inputs[0].element as HTMLInputElement,
+      makeFile("data.csv", "a,b\n1,2\n"),
+    );
+    // Script file whose .text() rejects — simulates a local read failure.
+    await setInputFile(
+      inputs[1].element as HTMLInputElement,
+      makeFileWithFailingText("script.py", new Error("read failed")),
+    );
+
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    const emissions = wrapper.emitted("notify");
+    expect(emissions).toBeDefined();
+    expect(emissions).toHaveLength(1);
+    const payload = emissions![0][0] as { level: string; message: string };
+    expect(payload.level).toBe("error");
+    expect(payload.message).toBe("read failed");
+  });
+
+  it("does_not_emit_uploaded_when_file_read_fails", async () => {
+    mockUploadFiles.mockResolvedValue(sampleJob);
 
     const wrapper = mount(UploadForm);
     const inputs = wrapper.findAll('input[type="file"]');
@@ -204,13 +330,13 @@ describe("UploadForm.vue — uploaded event", () => {
     );
     await setInputFile(
       inputs[1].element as HTMLInputElement,
-      makeFile("script.py", "print('hi')\n"),
+      makeFileWithFailingText("script.py", new Error("read failed")),
     );
 
     await wrapper.find("button.btn--primary").trigger("click");
     await flushPromises();
 
-    expect(wrapper.text()).toContain("network down");
+    expect(wrapper.emitted("uploaded")).toBeUndefined();
   });
 
   it("does_not_emit_uploaded_when_script_has_wrong_extension", async () => {
@@ -266,37 +392,109 @@ describe("UploadForm.vue — uploaded event", () => {
     expect(wrapper.emitted("uploaded")).toBeUndefined();
     expect(mockUploadFiles).not.toHaveBeenCalled();
   });
+});
 
-  it("emits_uploaded_payload_matches_exact_file_contents", async () => {
-    mockUploadFiles.mockResolvedValue(sampleJob);
+// ---------------------------------------------------------------------------
+// Tests: in-flight loading indicator + disabled button
+// ---------------------------------------------------------------------------
 
-    // Distinct contents in each file to guarantee no swap/reuse.
-    const scriptSource = "# SCRIPT_MARKER_9f2a\nprint('from script')\n";
-    const csvSource = "HEADER_MARKER_4b1c\nrow1,row2\n";
+describe("UploadForm.vue — loading indicator", () => {
+  beforeEach(() => {
+    mockUploadFiles.mockReset();
+  });
+
+  it("renders_loading_indicator_while_upload_is_in_flight_and_hides_after_resolution", async () => {
+    // Deferred promise — resolve only after we've asserted the loading state.
+    let resolve!: (j: Job) => void;
+    const pending = new Promise<Job>((res) => {
+      resolve = res;
+    });
+    mockUploadFiles.mockReturnValue(pending);
 
     const wrapper = mount(UploadForm);
     const inputs = wrapper.findAll('input[type="file"]');
     await setInputFile(
       inputs[0].element as HTMLInputElement,
-      makeFile("data.csv", csvSource),
+      makeFile("data.csv", "a,b\n1,2\n"),
     );
     await setInputFile(
       inputs[1].element as HTMLInputElement,
-      makeFile("script.py", scriptSource),
+      makeFile("script.py", "print('hi')\n"),
     );
 
+    // Before click: no loading indicator.
+    expect(wrapper.find(".loading-indicator").exists()).toBe(false);
+
+    // Click — upload promise is pending (not yet resolved).
     await wrapper.find("button.btn--primary").trigger("click");
+    // No flushPromises yet — we want to observe the mid-flight UI.
+    await wrapper.vm.$nextTick();
+
+    // Indicator should be visible while in flight.
+    const indicator = wrapper.find(".loading-indicator");
+    expect(indicator.exists()).toBe(true);
+    expect(indicator.text()).toContain("Uploading...");
+
+    // Resolve the pending upload and let everything flush.
+    resolve(sampleJob);
     await flushPromises();
 
-    const payload = wrapper.emitted("uploaded")![0][0] as {
-      jobId: string;
-      script: string;
-      csv: string;
-    };
-    expect(payload).toEqual({
-      jobId: sampleJob.job_id,
-      script: scriptSource,
-      csv: csvSource,
+    // Indicator should be gone after resolution.
+    expect(wrapper.find(".loading-indicator").exists()).toBe(false);
+  });
+
+  it("disables_upload_button_while_upload_is_in_flight", async () => {
+    let resolve!: (j: Job) => void;
+    const pending = new Promise<Job>((res) => {
+      resolve = res;
     });
+    mockUploadFiles.mockReturnValue(pending);
+
+    const wrapper = mount(UploadForm);
+    const inputs = wrapper.findAll('input[type="file"]');
+    await setInputFile(
+      inputs[0].element as HTMLInputElement,
+      makeFile("data.csv", "a,b\n1,2\n"),
+    );
+    await setInputFile(
+      inputs[1].element as HTMLInputElement,
+      makeFile("script.py", "print('hi')\n"),
+    );
+
+    const button = wrapper.find("button.btn--primary")
+      .element as HTMLButtonElement;
+
+    // Before click with both files present: enabled.
+    expect(button.disabled).toBe(false);
+
+    await wrapper.find("button.btn--primary").trigger("click");
+    await wrapper.vm.$nextTick();
+
+    // During in-flight request: disabled.
+    expect(button.disabled).toBe(true);
+
+    resolve(sampleJob);
+    await flushPromises();
+
+    // After resolution: button re-enabled (files still set).
+    expect(button.disabled).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: sanity — no UploadStatus component anywhere
+// ---------------------------------------------------------------------------
+
+describe("UploadForm.vue — removed UploadStatus component", () => {
+  beforeEach(() => {
+    mockUploadFiles.mockReset();
+  });
+
+  it("does_not_render_any_UploadStatus_child_component", () => {
+    const wrapper = mount(UploadForm);
+    // Look up by name; if the component is not registered / not present, this
+    // returns an empty wrapper and .exists() is false.
+    const maybe = wrapper.findComponent({ name: "UploadStatus" });
+    expect(maybe.exists()).toBe(false);
   });
 });
