@@ -79,4 +79,30 @@ describe("dryRun() — real Pyodide integration (requires vitest browser mode)",
     },
     60_000,
   );
+
+  // Follow-on regression: scipy.stats' import chain transitively touches
+  // `subprocess.<attr>` (via scipy.fft -> _pocketfft_umath). An earlier
+  // iteration of applySandbox installed a sys.modules['subprocess'] stub
+  // whose __getattr__ raised RuntimeError, so `from scipy.stats import ...`
+  // exploded at import with a "subprocess execution is disabled" error.
+  // The fix drops subprocess (and the os.* subprocess surface) from the
+  // blocklist entirely. When browser-mode vitest is wired up, unskip this
+  // test — it would have caught the exact regression the source-level
+  // assertions in worker.source.test.ts now guard against.
+  it.skip(
+    "(browser) scipy.stats import under sandbox does not raise subprocess error",
+    async () => {
+      const script =
+        "import numpy\n" +
+        "from scipy import fft\n" +
+        "from scipy.stats import chisquare\n" +
+        "print('ok')";
+      // Single row; the script does not consume argv. Shape matches the
+      // sibling skipped tests in this file (string rows, .stdout.trim()).
+      const result = await dryRun(script, ["dummy"]);
+      expect(result.rows[0].stdout.trim()).toBe("ok");
+      expect(result.rows[0].stderr).toBe("");
+    },
+    60_000,
+  );
 });

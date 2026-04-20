@@ -287,3 +287,164 @@ describe("worker.ts — intentionally unblocked surfaces (spec §Sandbox Restric
     expect(sandboxBody).not.toMatch(/\bdel\s+builtins\./);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Follow-on regression: subprocess + os.* subprocess surface fully unblocked
+//
+// After the init-time-sandbox fix landed, a second import-chain bug was found:
+// scipy (specifically scipy.stats via scipy.fft -> _pocketfft_umath) touches
+// `subprocess.<attr>` at import time. The earlier iteration of applySandbox
+// installed a `sys.modules['subprocess']` stub whose `__getattr__` raised
+// RuntimeError, poisoning scipy import. Same class of bug applied to the
+// `os.system / os.popen / os.fork*/exec*/spawn*/posix_spawn*` setattr loop:
+// scientific packages enumerate os attributes at import and trip the stub.
+//
+// Spec + code were updated to drop both surfaces entirely. These assertions
+// would have caught that regression at source level — vitest catches the
+// bug without needing real Pyodide in the node environment. The end-to-end
+// companion lives as it.skip in dryRun.integration.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("worker.ts — subprocess / os.* subprocess surface is fully unblocked (regression)", () => {
+  it("applySandbox body does not reference 'subprocess' anywhere", () => {
+    // No sys.modules['subprocess'] stub, no _PROC_MSG constant, no
+    // "subprocess execution is disabled" literal, no comment that would
+    // suggest the stub is coming back. The intent is a hard absence so the
+    // earlier iteration cannot silently return.
+    const sandboxBody = getApplySandboxBody();
+    expect(sandboxBody).not.toContain("subprocess");
+  });
+
+  it("applySandbox body does not contain a _PROC_MSG constant", () => {
+    const sandboxBody = getApplySandboxBody();
+    expect(sandboxBody).not.toContain("_PROC_MSG");
+  });
+
+  it("applySandbox body does not contain the 'subprocess execution is disabled' literal", () => {
+    const sandboxBody = getApplySandboxBody();
+    expect(sandboxBody).not.toContain("subprocess execution is disabled");
+  });
+
+  it("applySandbox body does not alias `os` (no `import os as _os`)", () => {
+    // The earlier iteration imported os as `_os` to then enumerate and
+    // setattr a subprocess-surface list onto it. With that surface dropped,
+    // the alias itself should no longer exist.
+    const sandboxBody = getApplySandboxBody();
+    expect(sandboxBody).not.toMatch(/\bimport\s+os\s+as\s+_os\b/);
+  });
+
+  it("applySandbox body does not contain a setattr(_os, ...) loop", () => {
+    // Residual `setattr(_os, attr, _make_stub(...))` would poison
+    // os.system / os.popen / os.fork / os.exec / os.spawn / os.posix_spawn
+    // / os.forkpty on import — the exact kind of thing scipy trips over.
+    const sandboxBody = getApplySandboxBody();
+    expect(sandboxBody).not.toMatch(/setattr\(\s*_os\b/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Extend the "not blocked, intentionally" invariants to cover the new
+// surfaces. Assertions are on applySandbox's body so comments elsewhere in
+// worker.ts that legitimately explain "these are unblocked" do not false-
+// positive. Paired with the broader `not.toContain("subprocess")` above,
+// this pins the full list the code-reviewer approved.
+// ---------------------------------------------------------------------------
+
+describe("worker.ts — subprocess + os.* surfaces are NOT stubbed (extended invariant list)", () => {
+  const UNBLOCKED_SURFACES = [
+    "subprocess",
+    "os.system",
+    "os.popen",
+    "os.fork",
+    "os.exec",
+    "os.spawn",
+    "os.posix_spawn",
+    "os.forkpty",
+  ];
+
+  for (const surface of UNBLOCKED_SURFACES) {
+    it(`applySandbox body does not stub '${surface}'`, () => {
+      const sandboxBody = getApplySandboxBody();
+      // Plain substring absence — if any of these appear inside the sandbox
+      // body (as a string literal target of setattr, a sys.modules key, or
+      // a comment referring to a stub), that is the regression.
+      expect(sandboxBody).not.toContain(surface);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Intent-preservation sanity: the 11 network stdlib stubs and the 7 Python-
+// side setattr targets the code-reviewer called out must still be present.
+// Without this, "nothing should block anything" would pass vacuously if
+// someone accidentally gutted applySandbox.
+// ---------------------------------------------------------------------------
+
+describe("worker.ts — network stubs + js./pyodide. setattr targets preserved (intent sanity)", () => {
+  // Per applySandbox body: socket, urllib.request, urllib.error, http.client,
+  // ftplib, smtplib, telnetlib, poplib, imaplib, nntplib, xmlrpc.client.
+  const NET_STDLIB_STUBS = [
+    "socket",
+    "urllib.request",
+    "urllib.error",
+    "http.client",
+    "ftplib",
+    "smtplib",
+    "telnetlib",
+    "poplib",
+    "imaplib",
+    "nntplib",
+    "xmlrpc.client",
+  ];
+
+  it("applySandbox body still lists all 11 network stdlib stubs", () => {
+    const sandboxBody = getApplySandboxBody();
+    for (const mod of NET_STDLIB_STUBS) {
+      expect(sandboxBody).toMatch(
+        new RegExp(`['"]${mod.replace(/\./g, "\\.")}['"]`),
+      );
+    }
+  });
+
+  it("applySandbox body exposes exactly the 11 known network stubs to sys.modules", () => {
+    // Belt + braces: count the distinct quoted-literal module names that
+    // live inside the _NET_MODULES list. If someone adds a new entry
+    // without updating the test, this will tell us.
+    const sandboxBody = getApplySandboxBody();
+    const listMatch = sandboxBody.match(/_NET_MODULES\s*=\s*\[([\s\S]*?)\]/);
+    expect(listMatch).not.toBeNull();
+    const listBody = listMatch![1];
+    const quoted = listBody.match(/['"][^'"]+['"]/g) ?? [];
+    expect(quoted).toHaveLength(NET_STDLIB_STUBS.length);
+  });
+
+  // The 7 setattr targets per the docstring block above applySandbox:
+  //   pyodide.http.pyfetch
+  //   pyodide.code.run_js
+  //   pyodide.ffi.run_js
+  //   js.fetch
+  //   js.XMLHttpRequest
+  //   js.WebSocket
+  //   js.navigator.sendBeacon
+  const SETATTR_TARGETS: Array<{ owner: string; attr: string }> = [
+    { owner: "_ph", attr: "pyfetch" },
+    { owner: "_pc", attr: "run_js" },
+    { owner: "_pf", attr: "run_js" },
+    { owner: "_js", attr: "fetch" },
+    { owner: "_js", attr: "XMLHttpRequest" },
+    { owner: "_js", attr: "WebSocket" },
+    { owner: "_js.navigator", attr: "sendBeacon" },
+  ];
+
+  for (const { owner, attr } of SETATTR_TARGETS) {
+    it(`applySandbox body still setattrs '${attr}' on ${owner}`, () => {
+      const sandboxBody = getApplySandboxBody();
+      // Escape the dot in `_js.navigator` for the regex.
+      const ownerRe = owner.replace(/\./g, "\\.");
+      const re = new RegExp(
+        `setattr\\(\\s*${ownerRe}\\s*,\\s*['"]${attr}['"]`,
+      );
+      expect(sandboxBody).toMatch(re);
+    });
+  }
+});

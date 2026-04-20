@@ -94,7 +94,7 @@ for _k in _to_del:
 }
 
 /**
- * Applies the just-in-time network/subprocess sandbox. Runs *after*
+ * Applies the just-in-time network sandbox. Runs *after*
  * `loadPackagesFromImports` has resolved the script's imports and
  * *before* the user script is `exec`-ed. See spec §Sandbox Restrictions.
  *
@@ -107,10 +107,8 @@ for _k in _to_del:
  *     "JS-side scope").
  *   - Install `types.ModuleType` stubs into `sys.modules` for `socket`,
  *     `urllib.request`, `urllib.error`, `http.client`, `ftplib`, `smtplib`,
- *     `telnetlib`, `poplib`, `imaplib`, `nntplib`, `xmlrpc.client`, and
- *     `subprocess`. Each stub's `__getattr__` raises `RuntimeError`.
- *   - `setattr` on each enumerated `os.*` subprocess attribute that exists
- *     on the current Pyodide build; silently skip names that are absent.
+ *     `telnetlib`, `poplib`, `imaplib`, `nntplib`, `xmlrpc.client`.
+ *     Each stub's `__getattr__` raises `RuntimeError`.
  *
  * Throws if any of the above unexpectedly fails. Caller wraps the throw
  * into the `"sandbox setup failed: "` error message.
@@ -123,7 +121,6 @@ import types
 
 _NET_MSG = "network access is disabled"
 _JS_MSG = "dynamic JS evaluation is disabled"
-_PROC_MSG = "subprocess execution is disabled"
 
 
 def _make_stub(message):
@@ -162,7 +159,7 @@ setattr(_js, 'WebSocket', _make_stub(_NET_MSG))
 # navigator.sendBeacon lives on the js.navigator proxy, not on js directly.
 setattr(_js.navigator, 'sendBeacon', _make_stub(_NET_MSG))
 
-# ---- sys.modules stubs for network / subprocess stdlib --------------------
+# ---- sys.modules stubs for network stdlib ---------------------------------
 _NET_MODULES = [
     'socket',
     'urllib.request', 'urllib.error',
@@ -172,27 +169,6 @@ _NET_MODULES = [
 ]
 for _name in _NET_MODULES:
     sys.modules[_name] = _make_stub_module(_name, _NET_MSG)
-
-sys.modules['subprocess'] = _make_stub_module('subprocess', _PROC_MSG)
-
-# ---- os.* subprocess surface ---------------------------------------------
-# setattr (NOT delattr): user tracebacks must uniformly read RuntimeError,
-# not a mix of AttributeError / RuntimeError. Names absent on the current
-# Pyodide build (Pyodide's WASM omits fork/exec already) are skipped.
-import os as _os
-_OS_BLOCKED = [
-    'system', 'popen',
-    'execv', 'execvp', 'execve', 'execl', 'execlp', 'execle',
-    'execvpe',
-    'spawnl', 'spawnle', 'spawnlp', 'spawnlpe',
-    'spawnv', 'spawnve', 'spawnvp', 'spawnvpe',
-    'posix_spawn', 'posix_spawnp',
-    'forkpty', 'fork',
-]
-_proc_stub = _make_stub(_PROC_MSG)
-for _name in _OS_BLOCKED:
-    if hasattr(_os, _name):
-        setattr(_os, _name, _proc_stub)
 `);
 }
 
