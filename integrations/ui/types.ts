@@ -42,6 +42,7 @@ export interface TaskDispatch {
 export interface TaskStats {
   pending: number;
   in_flight: number;
+  awaiting_consensus: number;
   completed_total: number;
   completed_by_me: number;
 }

@@ -48,10 +48,14 @@ pub type UploadResponse = Job;
 
 /// Lifecycle state of a single task row owned by the task-distribution module.
 ///
-/// Tasks move `Pending -> Assigned -> Completed` on the happy path, or
-/// `Pending -> Assigned -> Pending` on deadline-based reclamation. After
-/// `attempts` reaches the cap (5) an expired `Assigned` task transitions to
-/// `Failed`.
+/// Tasks move `Pending -> Assigned -> AwaitingConsensus -> Completed` on the
+/// happy redundant path (Phase 4); a single submission with
+/// `redundancy_target = 1` collapses to
+/// `Pending -> Assigned -> Completed`. Deadline-based reclamation keeps the
+/// task in its current status while incrementing `attempts`; after
+/// `attempts` reaches the cap (5) an expired assignment transitions the
+/// task to `Failed`. Consensus over disagreeing hashes also resolves to
+/// `Failed` via `result_aggregation::try_resolve_consensus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -59,6 +63,11 @@ pub enum TaskStatus {
     Pending,
     /// Currently assigned to a worker with an active deadline.
     Assigned,
+    /// At least one submission has been accepted but consensus has not yet
+    /// been resolved (the `Submitted` count is still below
+    /// `redundancy_target`, or consensus was escalated). Task remains
+    /// eligible for dispatch to additional workers.
+    AwaitingConsensus,
     /// A submission for this task has been accepted.
     Completed,
     /// Task reclaimed after exhausting the retry budget without a submission.
@@ -142,8 +151,11 @@ pub struct SubmitTaskRequest {
 pub struct TaskStats {
     /// Tasks whose status is `Pending`.
     pub pending: i64,
-    /// Tasks in `Assigned` whose current assignment is `InFlight` and not past the deadline.
+    /// Tasks in `Assigned` or `AwaitingConsensus` whose current assignment
+    /// is `InFlight` and not past the deadline.
     pub in_flight: i64,
+    /// Tasks whose status is `AwaitingConsensus` for the job.
+    pub awaiting_consensus: i64,
     /// Tasks in status `Completed` for the job.
     pub completed_total: i64,
     /// Submitted assignments for the job whose `worker_id` matches the caller.
