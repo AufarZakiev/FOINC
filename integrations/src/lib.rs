@@ -9,6 +9,7 @@ use uuid::Uuid;
 /// progresses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     /// Job files have been uploaded and metadata persisted.
     Uploaded,
@@ -58,6 +59,7 @@ pub type UploadResponse = Job;
 /// `Failed` via `result_aggregation::try_resolve_consensus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// Ready to be picked up by a volunteer worker.
     Pending,
@@ -77,6 +79,7 @@ pub enum TaskStatus {
 /// Lifecycle state of a single assignment row linking a task to a worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum AssignmentStatus {
     /// Assignment is active and the worker's deadline has not yet passed.
     InFlight,
@@ -160,4 +163,47 @@ pub struct TaskStats {
     pub completed_total: i64,
     /// Submitted assignments for the job whose `worker_id` matches the caller.
     pub completed_by_me: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_status_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&JobStatus::Uploaded).unwrap(), r#""uploaded""#);
+        assert_eq!(serde_json::to_string(&JobStatus::Processing).unwrap(), r#""processing""#);
+        assert_eq!(serde_json::to_string(&JobStatus::Completed).unwrap(), r#""completed""#);
+        assert_eq!(serde_json::to_string(&JobStatus::Failed).unwrap(), r#""failed""#);
+        let round: JobStatus = serde_json::from_str(r#""completed""#).unwrap();
+        assert_eq!(round, JobStatus::Completed);
+    }
+
+    #[test]
+    fn task_status_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&TaskStatus::Pending).unwrap(), r#""pending""#);
+        assert_eq!(serde_json::to_string(&TaskStatus::Assigned).unwrap(), r#""assigned""#);
+        assert_eq!(
+            serde_json::to_string(&TaskStatus::AwaitingConsensus).unwrap(),
+            r#""awaiting_consensus""#,
+        );
+        assert_eq!(serde_json::to_string(&TaskStatus::Completed).unwrap(), r#""completed""#);
+        assert_eq!(serde_json::to_string(&TaskStatus::Failed).unwrap(), r#""failed""#);
+    }
+
+    #[test]
+    fn assignment_status_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&AssignmentStatus::InFlight).unwrap(),
+            r#""in_flight""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&AssignmentStatus::Submitted).unwrap(),
+            r#""submitted""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&AssignmentStatus::TimedOut).unwrap(),
+            r#""timed_out""#,
+        );
+    }
 }

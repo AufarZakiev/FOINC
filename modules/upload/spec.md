@@ -61,7 +61,7 @@ Multipart form-data upload of exactly two files.
   "script_filename": "string",
   "csv_size_bytes": 0,
   "script_size_bytes": 0,
-  "status": "Uploaded",
+  "status": "uploaded",
   "created_at": "2026-01-01T00:00:00Z"
 }
 ```
