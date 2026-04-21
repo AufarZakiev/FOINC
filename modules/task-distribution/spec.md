@@ -184,7 +184,44 @@ Components live under `modules/task-distribution/ui/`.
 | Component | Behavior |
 |-----------|----------|
 | `StartJobButton` | Props: `upload: UploadCompleted`. Emits: `started: [JobStarted]`, `notify: [Toast]`. Button calls `POST /jobs/{id}/start`; disables while in flight. On `200` emits `started`. On failure emits `notify` at `level: "error"`. |
-| `VolunteerRunner` | Props: none. Emits: `notify: [Toast]` on unexpected errors. Reads/creates `workerId` in `localStorage["foinc.worker_id"]`. Polls `POST /tasks/next` when idle, `GET /tasks/stats` while a job is in scope. On `TaskDispatch`: obtain `PyodideWorker` via `createPyodideWorker()` (from `modules/pyodide-runtime/ui/`), `init()` then `exec(task.script, task.input_rows[0].split(","))`. On success, `submitTask`. On exec failure, does NOT submit — backend reclaims via deadline. Always terminates the worker when done. Tracks last picked task's `job_id` as stats-poll target. |
+| `VolunteerRunner` | Props: none. Emits: `notify: [Toast]` on unexpected errors. Reads/creates `workerId` in `localStorage["foinc.worker_id"]`. Polls `POST /tasks/next` when idle, `GET /tasks/stats` while a job is in scope. Owns a single long-lived `PyodideWorker` field `runner: PyodideWorker \| null` (lazily assigned, see Lifecycle below). On `TaskDispatch`: obtain `runner` per Lifecycle rules, then `runner.exec(task.script, task.input_rows[0].split(","))`. On success, `submitTask`. On exec rejection that is a user-script fault (worker still alive), does NOT submit and does NOT recreate the worker — backend reclaims via deadline; the same `runner` services the next dispatch. On exec rejection that indicates the worker is dead (see Crash recovery below), does NOT submit — backend reclaims via deadline — and recreates the worker on the next `TaskDispatch`. Tracks last picked task's `job_id` as stats-poll target.
+
+**`VolunteerRunner` Pyodide worker lifecycle**
+
+Rationale: each `createPyodideWorker() + init()` pays ~10 s of Pyodide + numpy/scipy CDN fetch, WASM compile, and stdlib import. Reusing a worker across tasks is safe because the pyodide-runtime state machine's `Idle → Running → Idle` cycle is designed for repeated `exec` calls, and per-exec state (sys.argv, sys.stdin, stdout/stderr redirection, sandbox stubs) is re-applied on every `Idle → Running` transition.
+
+`VolunteerRunner` processes at most one `TaskDispatch` at a time: polling `POST /tasks/next` is gated on no `exec` being in flight and no Lazy-create `init()` being in flight. All lifecycle-table rows below assume this single-dispatch-at-a-time invariant.
+
+| Phase | Trigger | Side effect |
+|-------|---------|-------------|
+| Lazy create | First `TaskDispatch` received AND `runner === null` | Assign `runner = createPyodideWorker()`, then `await runner.init()` (pays the one-time ~10 s init cost). If `init()` rejects: in order, (a) best-effort `runner.terminate()` to free the Web Worker process that failed to load Pyodide (exceptions swallowed), (b) set `runner = null`, (c) emit `notify` at `level: "error"`; do NOT submit; backend reclaims via deadline. Do NOT retry `init()` for the same dispatch; the next `TaskDispatch` will lazy-create fresh. |
+| Reuse | Subsequent `TaskDispatch` received AND `runner !== null` | Call `runner.exec(...)` directly against the existing idle worker. No `init()`, no `terminate()`. |
+| Crash recovery | `runner.exec(...)` rejects with a dead-worker signal (see table below) | Best-effort `runner.terminate()`, then `runner = null`. Do NOT re-run the failed task on the spot; the backend reclaims via deadline. The next `TaskDispatch` triggers Lazy create. One recreate per dead-worker event, not a loop. |
+| Unmount | Component unmount | Flip a component-local `mounted` flag to `false` (set once at unmount, read by the `exec` resolution path). If `runner !== null`, call `runner.terminate()` immediately and set `runner = null`. Best-effort; exceptions from `terminate()` are swallowed. If an `exec` was in flight at unmount, its eventual resolution (fulfilled or rejected) MUST be guarded by the `mounted` flag: when `mounted === false`, the resolution handler returns without calling `submitTask`, without emitting `notify`, and without mutating `runner` further. |
+
+Idle volunteers that never receive a `TaskDispatch` never call `createPyodideWorker()`, so they never pay the init cost.
+
+**Classifying `exec` rejections (dead-worker vs user-script fault)**
+
+The pyodide-runtime module's state machine (see `modules/pyodide-runtime/spec.md`) enumerates the rejection surface of `PyodideWorker.exec`. `VolunteerRunner` classifies each rejection as either "dead-worker" (triggers Crash recovery) or "user-script fault" (worker stays alive, reuse on next dispatch):
+
+| pyodide-runtime event | `exec` outcome | Worker post-state | `VolunteerRunner` classification |
+|-----------------------|----------------|-------------------|----------------------------------|
+| `Script raises exception` (including sandbox-stub `RuntimeError`) | rejects with traceback message | `Idle` (alive, reusable) | user-script fault — reuse |
+| `loadPackagesFromImports` fails (step 1) | rejects with `"package load failed: …"` | `Idle` (alive, reusable) | user-script fault — reuse |
+| `Sandbox application fails` (steps 2-5) | rejects with `"sandbox setup failed: …"` | `Idle` (alive, reusable) | user-script fault — reuse (not expected in practice per pyodide-runtime spec) |
+| `stdout exceeds 10 MB` | rejects with `"stdout limit exceeded (10 MB)"` | `Idle` (alive, reusable) | user-script fault — reuse |
+| `30 s timeout fires` | rejects (timeout path) | `Terminated` (dead) | dead-worker — recreate |
+| Any subsequent `exec` after the worker entered `Terminated` | rejects immediately (per pyodide-runtime `PyodideWorker.exec` contract) | `Terminated` (dead) | dead-worker — recreate |
+
+**Default is reuse.** The only rejections that trigger Crash recovery are the two "dead-worker" rows above, which correspond to positive evidence of a dead worker (the 30 s timeout path, or an immediate post-`Terminated` rejection). Every other rejection — including any rejection whose shape `VolunteerRunner` does not recognize — is classified as "user-script fault": the worker is assumed alive and reusable, the failed task is not re-run (backend reclaims via deadline), and the same `runner` services the next `TaskDispatch`. If such a worker is in fact stuck, the next `exec` call will itself reject immediately per the pyodide-runtime `PyodideWorker.exec` contract (post-`Terminated` row above), which IS a dead-worker signal and WILL promote it to Crash recovery on that dispatch. This one-dispatch lag is accepted in exchange for never recreating a live worker on a spurious classification.
+
+`VolunteerRunner` distinguishes "dead-worker" from "user-script fault" by the shape/source of the rejection, not by inspecting the text of the Python traceback. If the pyodide-runtime module later tags its rejection with a discriminator (e.g. `code: "timeout" | "worker_error"`), `VolunteerRunner` MUST use that discriminator.
+
+<!-- TODO: the `PyodideWorker.exec` rejection shape that `VolunteerRunner` classifies on (currently referenced via prose naming of pyodide-runtime's module spec) should move to `integrations/ui/` as a typed discriminator union (e.g. `{ code: "timeout" | "worker_error" | "script_error" | ... }`). This spec currently references `modules/pyodide-runtime/spec.md` by name, which is pre-existing scope drift vs constitution's "a module spec may not reference another module's spec"; the TODO unblocks cross-module typing when someone does the follow-up. Not fixed in this iteration. -->
+
+
+Emit `notify` at `level: "error"` only on the first `init()` failure after a Lazy-create, and on unexpected network/5xx errors hitting the backend API. Do NOT emit `notify` on per-task exec rejections (user-script faults are normal operation; dead-worker recoveries are expected and self-healing). |
 
 **Module-internal API client (`modules/task-distribution/ui/api.ts`)**
 

@@ -85,6 +85,7 @@ function makeStats(overrides: Partial<TaskStats> = {}): TaskStats {
   return {
     pending: 0,
     in_flight: 0,
+    awaiting_consensus: 0,
     completed_total: 0,
     completed_by_me: 0,
     ...overrides,
@@ -282,8 +283,9 @@ describe("VolunteerRunner.vue — dispatch and execution", () => {
       duration_ms: 11,
     });
 
-    // Worker terminated afterwards.
-    expect(mockTerminate).toHaveBeenCalledTimes(1);
+    // Spec: worker is reused. After a successful dispatch the long-lived
+    // runner stays alive; terminate() is not called until unmount.
+    expect(mockTerminate).toHaveBeenCalledTimes(0);
 
     // Template is back to "Idle" because currentTask is cleared.
     expect(wrapper.text()).toContain("Idle");
@@ -293,7 +295,9 @@ describe("VolunteerRunner.vue — dispatch and execution", () => {
     await settle();
     expect(mockPollNextTask).toHaveBeenCalledTimes(2);
 
+    // Now unmount and confirm the unmount-path terminates the reused worker.
     wrapper.unmount();
+    expect(mockTerminate).toHaveBeenCalledTimes(1);
   });
 
   it("does_NOT_submit_when_exec_rejects_continues_polling_silently", async () => {
@@ -303,6 +307,9 @@ describe("VolunteerRunner.vue — dispatch and execution", () => {
     mockPollNextTask
       .mockResolvedValueOnce(dispatch)
       .mockResolvedValue(null);
+    // "script crashed" is not one of the two dead-worker signals, so per
+    // spec's "default is reuse" rule this is a user-script fault — the
+    // worker stays alive, no terminate, no notify.
     mockExec.mockRejectedValueOnce(new Error("script crashed"));
 
     const wrapper = mount(VolunteerRunner);
@@ -316,10 +323,11 @@ describe("VolunteerRunner.vue — dispatch and execution", () => {
     // Crucially: submitTask was NOT called (silent reclamation).
     expect(mockSubmitTask).not.toHaveBeenCalled();
 
-    // Worker was terminated regardless.
-    expect(mockTerminate).toHaveBeenCalledTimes(1);
+    // Spec: user-script fault → reuse. terminate() is NOT called on the
+    // reject path; the runner stays alive for the next dispatch.
+    expect(mockTerminate).toHaveBeenCalledTimes(0);
 
-    // No notify emitted (spec: exec failures are silent).
+    // No notify emitted (spec: per-task exec rejections are silent).
     expect(wrapper.emitted("notify")).toBeUndefined();
 
     // Polling resumes.
@@ -344,10 +352,349 @@ describe("VolunteerRunner.vue — dispatch and execution", () => {
 
     expect(mockExec).not.toHaveBeenCalled();
     expect(mockSubmitTask).not.toHaveBeenCalled();
+    // Spec Lazy-create failure branch: best-effort terminate of the failed
+    // Web Worker process, then runner = null.
     expect(mockTerminate).toHaveBeenCalledTimes(1);
+
+    // Spec mandates emit notify at level: "error" on the first init()
+    // failure after a Lazy-create.
+    const notifyEvents = wrapper.emitted("notify");
+    expect(notifyEvents).toBeDefined();
+    expect(notifyEvents).toHaveLength(1);
+    const [toast] = notifyEvents![0] as [{ level: string; message: string }];
+    expect(toast.level).toBe("error");
+    expect(toast.message).toBe("pyodide failed to load");
+
+    wrapper.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — Pyodide worker lifecycle (reuse, crash recovery, unmount guard)
+// ---------------------------------------------------------------------------
+
+describe("VolunteerRunner.vue — Pyodide worker lifecycle", () => {
+  it("reuses_the_same_worker_across_two_successful_dispatches", async () => {
+    localStorage.setItem(WORKER_ID_KEY, "w");
+    const d1 = makeDispatch({
+      task_id: "aaaa1111-0000-0000-0000-000000000000",
+    });
+    const d2 = makeDispatch({
+      task_id: "bbbb2222-0000-0000-0000-000000000000",
+    });
+
+    mockPollNextTask
+      .mockResolvedValueOnce(d1)
+      .mockResolvedValueOnce(d2)
+      .mockResolvedValue(null);
+
+    const wrapper = mount(VolunteerRunner);
+    await settle();
+    // First poll (delay 0) → dispatch 1.
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    // Second poll (after POLL_INTERVAL_MS) → dispatch 2.
+    await vi.advanceTimersByTimeAsync(2000);
+    await settle();
+
+    // Spec: single long-lived runner; Lazy-create runs once, Reuse on 2nd.
+    expect(mockCreatePyodideWorker).toHaveBeenCalledTimes(1);
+    expect(mockInit).toHaveBeenCalledTimes(1);
+    expect(mockExec).toHaveBeenCalledTimes(2);
+
+    // Both dispatches submitted results.
+    expect(mockSubmitTask).toHaveBeenCalledTimes(2);
+    expect(mockSubmitTask.mock.calls[0][0]).toBe(d1.task_id);
+    expect(mockSubmitTask.mock.calls[1][0]).toBe(d2.task_id);
+
+    // No terminate during reuse.
+    expect(mockTerminate).toHaveBeenCalledTimes(0);
+
+    // Unmount terminates the reused worker exactly once.
+    wrapper.unmount();
+    expect(mockTerminate).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses_worker_after_user_script_fault_without_recreate", async () => {
+    localStorage.setItem(WORKER_ID_KEY, "w");
+    const d1 = makeDispatch({
+      task_id: "aaaa1111-0000-0000-0000-000000000000",
+    });
+    const d2 = makeDispatch({
+      task_id: "bbbb2222-0000-0000-0000-000000000000",
+    });
+
+    mockPollNextTask
+      .mockResolvedValueOnce(d1)
+      .mockResolvedValueOnce(d2)
+      .mockResolvedValue(null);
+
+    // First exec: user-script fault (a Python runtime error). Per spec's
+    // "default is reuse" rule, the worker stays alive.
+    mockExec
+      .mockRejectedValueOnce(new Error("RuntimeError: boom"))
+      .mockResolvedValueOnce({
+        stdout: "ok2",
+        stderr: "",
+        durationMs: 22,
+      });
+
+    const wrapper = mount(VolunteerRunner);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    await vi.advanceTimersByTimeAsync(2000);
+    await settle();
+
+    // No recreate — one worker, one init.
+    expect(mockCreatePyodideWorker).toHaveBeenCalledTimes(1);
+    expect(mockInit).toHaveBeenCalledTimes(1);
+    expect(mockExec).toHaveBeenCalledTimes(2);
+
+    // Only the second dispatch submitted; the first was silently reclaimed
+    // by the backend via deadline.
+    expect(mockSubmitTask).toHaveBeenCalledTimes(1);
+    expect(mockSubmitTask.mock.calls[0][0]).toBe(d2.task_id);
+
+    // No terminate during reuse; no notify for user-script fault.
+    expect(mockTerminate).toHaveBeenCalledTimes(0);
     expect(wrapper.emitted("notify")).toBeUndefined();
 
     wrapper.unmount();
+  });
+
+  it("recreates_worker_after_30s_timeout_dead_worker_signal", async () => {
+    localStorage.setItem(WORKER_ID_KEY, "w");
+    const d1 = makeDispatch({
+      task_id: "aaaa1111-0000-0000-0000-000000000000",
+    });
+    const d2 = makeDispatch({
+      task_id: "bbbb2222-0000-0000-0000-000000000000",
+    });
+
+    mockPollNextTask
+      .mockResolvedValueOnce(d1)
+      .mockResolvedValueOnce(d2)
+      .mockResolvedValue(null);
+
+    // Dead-worker signal #1: 30s timeout.
+    mockExec
+      .mockRejectedValueOnce(new Error("Execution timed out (30s)"))
+      .mockResolvedValueOnce({
+        stdout: "ok2",
+        stderr: "",
+        durationMs: 22,
+      });
+
+    const wrapper = mount(VolunteerRunner);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    await vi.advanceTimersByTimeAsync(2000);
+    await settle();
+
+    // Spec: Crash recovery — terminate dead worker, next dispatch
+    // lazy-creates a fresh one.
+    expect(mockCreatePyodideWorker).toHaveBeenCalledTimes(2);
+    expect(mockInit).toHaveBeenCalledTimes(2);
+    // Before unmount: exactly one terminate from the crash-recovery path.
+    expect(mockTerminate).toHaveBeenCalledTimes(1);
+
+    // First submit not called (backend reclaims); second submit called.
+    expect(mockSubmitTask).toHaveBeenCalledTimes(1);
+    expect(mockSubmitTask.mock.calls[0][0]).toBe(d2.task_id);
+
+    // Spec: crash recovery is silent — no notify.
+    expect(wrapper.emitted("notify")).toBeUndefined();
+
+    wrapper.unmount();
+  });
+
+  it("recreates_worker_after_worker_is_terminated_dead_worker_signal", async () => {
+    localStorage.setItem(WORKER_ID_KEY, "w");
+    const d1 = makeDispatch({
+      task_id: "aaaa1111-0000-0000-0000-000000000000",
+    });
+    const d2 = makeDispatch({
+      task_id: "bbbb2222-0000-0000-0000-000000000000",
+    });
+
+    mockPollNextTask
+      .mockResolvedValueOnce(d1)
+      .mockResolvedValueOnce(d2)
+      .mockResolvedValue(null);
+
+    // Dead-worker signal #2: immediate reject from post-Terminated state.
+    mockExec
+      .mockRejectedValueOnce(new Error("Worker is terminated"))
+      .mockResolvedValueOnce({
+        stdout: "ok2",
+        stderr: "",
+        durationMs: 22,
+      });
+
+    const wrapper = mount(VolunteerRunner);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    await vi.advanceTimersByTimeAsync(2000);
+    await settle();
+
+    expect(mockCreatePyodideWorker).toHaveBeenCalledTimes(2);
+    expect(mockInit).toHaveBeenCalledTimes(2);
+    // Before unmount: exactly one terminate from the crash-recovery path.
+    expect(mockTerminate).toHaveBeenCalledTimes(1);
+
+    expect(mockSubmitTask).toHaveBeenCalledTimes(1);
+    expect(mockSubmitTask.mock.calls[0][0]).toBe(d2.task_id);
+
+    expect(wrapper.emitted("notify")).toBeUndefined();
+
+    wrapper.unmount();
+  });
+
+  it("recreates_worker_when_timeout_error_message_is_a_superset", async () => {
+    // Pins `.includes()` semantics in isDeadWorkerRejection. A future
+    // refactor to strict equality (`=== "Execution timed out (30s)"`)
+    // would break this test because the real message is wrapped inside
+    // a longer "TaskTimeout: ... at line 42" string.
+    localStorage.setItem(WORKER_ID_KEY, "w");
+    const d1 = makeDispatch({
+      task_id: "aaaa1111-0000-0000-0000-000000000000",
+    });
+    const d2 = makeDispatch({
+      task_id: "bbbb2222-0000-0000-0000-000000000000",
+    });
+
+    mockPollNextTask
+      .mockResolvedValueOnce(d1)
+      .mockResolvedValueOnce(d2)
+      .mockResolvedValue(null);
+
+    // Superset of the dead-worker signal: message contains the exact
+    // "Execution timed out (30s)" substring surrounded by prefix/suffix.
+    mockExec
+      .mockRejectedValueOnce(
+        new Error("TaskTimeout: Execution timed out (30s) at line 42"),
+      )
+      .mockResolvedValueOnce({
+        stdout: "ok2",
+        stderr: "",
+        durationMs: 22,
+      });
+
+    const wrapper = mount(VolunteerRunner);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+    await vi.advanceTimersByTimeAsync(2000);
+    await settle();
+
+    // Crash recovery still triggers because classifier uses includes().
+    expect(mockCreatePyodideWorker).toHaveBeenCalledTimes(2);
+    expect(mockInit).toHaveBeenCalledTimes(2);
+
+    wrapper.unmount();
+  });
+
+  it("unmount_during_init_guards_exec_submit_and_notify", async () => {
+    // Covers the post-init mounted guard (VolunteerRunner.vue lines 159-162):
+    // if the component is unmounted while init() is in flight, neither
+    // exec() nor submitTask() nor notify should be touched afterwards.
+    localStorage.setItem(WORKER_ID_KEY, "w");
+    const dispatch = makeDispatch();
+
+    mockPollNextTask
+      .mockResolvedValueOnce(dispatch)
+      .mockResolvedValue(null);
+
+    // Manually resolvable init so we can unmount BEFORE init resolves.
+    let resolveInit: () => void;
+    const pendingInit = new Promise<void>((r) => {
+      resolveInit = r;
+    });
+    mockInit.mockReturnValueOnce(pendingInit);
+
+    const wrapper = mount(VolunteerRunner);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+
+    // init is in flight; exec should not have been called yet.
+    expect(mockCreatePyodideWorker).toHaveBeenCalledTimes(1);
+    expect(mockInit).toHaveBeenCalledTimes(1);
+    expect(mockExec).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    // Unmount itself terminates the runner exactly once.
+    expect(mockTerminate).toHaveBeenCalledTimes(1);
+
+    // Now let init resolve AFTER unmount. The post-init `!mounted || runner === null`
+    // guard must bail before reaching exec.
+    resolveInit!();
+    await settle();
+
+    // Post-init guard: exec never called, no submit, no notify, no extra terminate.
+    expect(mockExec).not.toHaveBeenCalled();
+    expect(mockSubmitTask).not.toHaveBeenCalled();
+    expect(wrapper.emitted("notify")).toBeUndefined();
+    expect(mockTerminate).toHaveBeenCalledTimes(1);
+  });
+
+  it("unmount_during_exec_guards_submit_and_notify_with_mounted_flag", async () => {
+    localStorage.setItem(WORKER_ID_KEY, "w");
+    const dispatch = makeDispatch();
+
+    mockPollNextTask
+      .mockResolvedValueOnce(dispatch)
+      .mockResolvedValue(null);
+
+    // Manually resolvable exec so we can unmount BEFORE the exec resolves.
+    let resolveExec: (v: {
+      stdout: string;
+      stderr: string;
+      durationMs: number;
+    }) => void;
+    const pendingExec = new Promise<{
+      stdout: string;
+      stderr: string;
+      durationMs: number;
+    }>((r) => {
+      resolveExec = r;
+    });
+    mockExec.mockReturnValueOnce(pendingExec);
+
+    const wrapper = mount(VolunteerRunner);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1);
+    await settle();
+
+    // exec is in flight; unmount now.
+    expect(mockExec).toHaveBeenCalledTimes(1);
+    expect(mockSubmitTask).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    // Unmount terminates the reused worker exactly once.
+    expect(mockTerminate).toHaveBeenCalledTimes(1);
+
+    // Snapshot getTaskStats call count before the late resolve so we can
+    // assert the finally { if (mounted) refreshStats() } guard suppresses
+    // a post-unmount stats refresh. Catches removal of that guard.
+    const statsCallsBeforeLateResolve = mockGetTaskStats.mock.calls.length;
+
+    // Now let exec resolve AFTER unmount.
+    resolveExec!({ stdout: "late", stderr: "", durationMs: 9 });
+    await settle();
+
+    // mounted-flag guard: no submit, no notify, no extra terminate.
+    expect(mockSubmitTask).not.toHaveBeenCalled();
+    expect(wrapper.emitted("notify")).toBeUndefined();
+    expect(mockTerminate).toHaveBeenCalledTimes(1);
+    // And the finally-block's `if (mounted) refreshStats()` guard must
+    // suppress a post-unmount stats fetch.
+    expect(mockGetTaskStats.mock.calls.length).toBe(
+      statsCallsBeforeLateResolve,
+    );
   });
 });
 
