@@ -105,4 +105,31 @@ describe("dryRun() — real Pyodide integration (requires vitest browser mode)",
     },
     60_000,
   );
+
+  // Regression: cleanupPythonNamespace used to wipe Pyodide-installed
+  // packages (numpy, scipy, openblas, …) between exec calls. Row 1 loaded
+  // numpy fresh; row 2+ re-imported it on top of the wiped entry, which
+  // Python detects and surfaces as
+  //   UserWarning: The NumPy module was reloaded (imported a second time)
+  // on stderr — plus ~100-500 ms wasted per exec re-loading the package.
+  //
+  // The fix refreshes sys._initial_modules at the end of cleanup so
+  // packages installed during an exec persist into the next row's
+  // baseline. Source-level ordering guards live in worker.source.test.ts;
+  // this is the end-to-end probe for browser mode.
+  it.skip(
+    "(browser) numpy not reloaded between exec calls — no UserWarning on row 2+",
+    async () => {
+      const script =
+        "import numpy\nimport warnings\nwith warnings.catch_warnings():\n    warnings.simplefilter('error')\n    import numpy\nprint('ok')";
+      const csv = ["row1", "row2", "row3"];
+      const result = await dryRun(script, csv);
+      expect(result.rows.length).toBe(3);
+      for (const row of result.rows) {
+        expect(row.stdout.trim()).toBe("ok");
+        expect(row.stderr).toBe(""); // no UserWarning on any row
+      }
+    },
+    60_000,
+  );
 });

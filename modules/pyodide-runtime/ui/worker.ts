@@ -57,8 +57,14 @@ function errorMessage(e: unknown): string {
 }
 
 /**
- * Resets the Python global namespace and clears user-imported modules
- * from sys.modules, ensuring each exec call starts from a clean state.
+ * Resets the __main__ namespace and drops user-imported modules (and sandbox
+ * stubs) so each exec starts clean; Pyodide-installed packages (numpy, etc.)
+ * persist across calls by re-snapshotting sys.modules at the end.
+ *
+ * Trade-off: if a user script mutates a cached module (e.g. `np.array = ...`),
+ * that mutation persists to subsequent execs. Acceptable because dry-run and
+ * task execution run the same trusted user script on every row; threat model
+ * is network egress only, not inter-row isolation.
  */
 function cleanupPythonNamespace(): void {
   if (!pyodide) return;
@@ -87,6 +93,8 @@ for _k in _to_del:
         delattr(_main, _k)
     except Exception:
         pass
+
+sys._initial_modules = set(sys.modules.keys())
 `);
   } catch {
     // Cleanup is best-effort; do not fail the exec result

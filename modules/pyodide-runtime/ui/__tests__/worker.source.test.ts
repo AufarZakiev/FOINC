@@ -71,6 +71,32 @@ function getApplySandboxBody(): string {
 }
 
 /**
+ * Returns the body of `function cleanupPythonNamespace() { ... }` — the
+ * per-exec cleanup routine. Used to assert the refresh assignment to
+ * `sys._initial_modules` happens AFTER the removal loops (otherwise the
+ * "don't wipe Pyodide packages between execs" fix is a no-op).
+ */
+function getCleanupBody(): string {
+  const marker = "function cleanupPythonNamespace()";
+  const start = WORKER_SRC.indexOf(marker);
+  if (start === -1) {
+    throw new Error("cleanupPythonNamespace() not found in worker.ts");
+  }
+  const braceOpen = WORKER_SRC.indexOf("{", start);
+  let depth = 0;
+  let i = braceOpen;
+  for (; i < WORKER_SRC.length; i++) {
+    const c = WORKER_SRC[i];
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) break;
+    }
+  }
+  return WORKER_SRC.slice(braceOpen, i + 1);
+}
+
+/**
  * Returns the body of the `if (msg.type === "init" && ...)` block — the
  * init-time code path. Used to assert that sandbox operations are NOT
  * present here.
@@ -447,4 +473,73 @@ describe("worker.ts — network stubs + js./pyodide. setattr targets preserved (
       expect(sandboxBody).toMatch(re);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Regression: cleanupPythonNamespace refreshes `sys._initial_modules` AFTER
+// the removal loops, so Pyodide-installed packages (numpy, scipy, openblas,
+// …) loaded during an exec are rolled into the baseline for the next exec.
+//
+// Earlier iteration wiped those packages between execs, producing
+//   UserWarning: The NumPy module was reloaded (imported a second time)
+// on row 2+ and paying ~100-500 ms per subsequent exec to reload them.
+// These assertions would have caught that at source level without Pyodide.
+// ---------------------------------------------------------------------------
+
+describe("worker.ts — cleanupPythonNamespace refreshes initial-modules snapshot (numpy-reload regression)", () => {
+  it("cleanupPythonNamespace body contains an assignment to sys._initial_modules", () => {
+    // At minimum the refreshed snapshot at the end must be an assignment
+    // (not just a `hasattr` read). Without it, packages installed during
+    // this exec would be wiped on the next call.
+    const cleanupBody = getCleanupBody();
+    expect(cleanupBody).toMatch(/sys\._initial_modules\s*=\s*set\(/);
+  });
+
+  it("refresh assignment appears AFTER the `for _k in _to_remove: del sys.modules[_k]` loop", () => {
+    // If the refresh runs before the removal loop, the loop's deletions
+    // are immediately re-snapshotted-as-absent and the next exec re-wipes
+    // them — the fix becomes a no-op. Order is load-bearing.
+    const cleanupBody = getCleanupBody();
+    const removalIdx = cleanupBody.search(
+      /for\s+_k\s+in\s+_to_remove\s*:\s*\n\s*del\s+sys\.modules\[_k\]/,
+    );
+    expect(removalIdx).toBeGreaterThan(-1);
+
+    // Find the LAST `sys._initial_modules =` assignment — that's the
+    // refresh, as opposed to the init-guarded seed at the top of the
+    // function (which lives inside `if not hasattr(...)`).
+    const assignRe = /sys\._initial_modules\s*=\s*set\(/g;
+    let lastAssignIdx = -1;
+    let m: RegExpExecArray | null;
+    while ((m = assignRe.exec(cleanupBody)) !== null) {
+      lastAssignIdx = m.index;
+    }
+    expect(lastAssignIdx).toBeGreaterThan(-1);
+    expect(lastAssignIdx).toBeGreaterThan(removalIdx);
+  });
+
+  it("refresh assignment appears AFTER the __main__ namespace `delattr` loop", () => {
+    // Ordering invariant (spec-neutral but correctness-critical): the
+    // refresh must be the final statement of the cleanup, so the
+    // next-call baseline reflects the fully-cleaned state. If refresh
+    // ran before the __main__ delattr loop, __main__ user symbols
+    // wouldn't actually be part of sys.modules anyway (they live on
+    // __main__'s namespace), so it's spec-neutral — but a future reader
+    // could reasonably expect the refresh to close the function, and
+    // this ordering keeps that intuition intact.
+    const cleanupBody = getCleanupBody();
+    const delattrIdx = cleanupBody.search(
+      /for\s+_k\s+in\s+_to_del\s*:[\s\S]*?delattr\(_main,\s*_k\)/,
+    );
+    expect(delattrIdx).toBeGreaterThan(-1);
+
+    const assignRe = /sys\._initial_modules\s*=\s*set\(/g;
+    let lastAssignIdx = -1;
+    let m: RegExpExecArray | null;
+    while ((m = assignRe.exec(cleanupBody)) !== null) {
+      lastAssignIdx = m.index;
+    }
+    expect(lastAssignIdx).toBeGreaterThan(-1);
+    expect(lastAssignIdx).toBeGreaterThan(delattrIdx);
+  });
 });
