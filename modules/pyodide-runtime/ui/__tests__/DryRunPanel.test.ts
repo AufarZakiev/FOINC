@@ -385,6 +385,111 @@ describe("DryRunPanel.vue", () => {
     expect(wrapper.emitted("notify")).toHaveLength(1);
   });
 
+  // ---- tail() derivation of toast message from traceback ---------------
+  //
+  // `tail` is a closure inside DryRunPanel.vue's <script setup>. We exercise
+  // it end-to-end: dryRun rejects with a crafted `message`, the panel emits
+  // `notify` with the tailed form, and we assert the emitted payload.
+
+  it("tail: multi-line Python traceback emits only the last non-empty line", async () => {
+    const traceback = [
+      "Traceback (most recent call last):",
+      '  File "<user-script>", line 3, in <module>',
+      "    urllib.request.urlopen('http://evil.example.com')",
+      '  File "/lib/python3.11/site-packages/pyodide/_package_loader.py", line 42, in __getattr__',
+      "    raise RuntimeError(message)",
+      "RuntimeError: network access is disabled",
+    ].join("\n");
+    mockDryRun.mockRejectedValue(new Error(traceback));
+
+    const upload = makeUpload();
+    const wrapper = mount(DryRunPanel, { props: { upload } });
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    const emitted = wrapper.emitted("notify");
+    expect(emitted).toBeDefined();
+    expect(emitted).toHaveLength(1);
+    expect(emitted![0]).toEqual([
+      { level: "error", message: "RuntimeError: network access is disabled" },
+    ]);
+  });
+
+  it("tail: single-line error message passes through unchanged (no regression)", async () => {
+    mockDryRun.mockRejectedValue(new Error("Pyodide load failed"));
+
+    const upload = makeUpload();
+    const wrapper = mount(DryRunPanel, { props: { upload } });
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    const emitted = wrapper.emitted("notify");
+    expect(emitted).toBeDefined();
+    expect(emitted).toHaveLength(1);
+    expect(emitted![0]).toEqual([
+      { level: "error", message: "Pyodide load failed" },
+    ]);
+  });
+
+  it("tail: trailing newlines are stripped — 'RuntimeError: boom\\n\\n' becomes 'RuntimeError: boom'", async () => {
+    mockDryRun.mockRejectedValue(new Error("RuntimeError: boom\n\n"));
+
+    const upload = makeUpload();
+    const wrapper = mount(DryRunPanel, { props: { upload } });
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    const emitted = wrapper.emitted("notify");
+    expect(emitted).toBeDefined();
+    expect(emitted).toHaveLength(1);
+    // Must be "RuntimeError: boom", not "".
+    expect(emitted![0]).toEqual([
+      { level: "error", message: "RuntimeError: boom" },
+    ]);
+  });
+
+  it("tail: falls back to original message if tailing produces empty string", async () => {
+    // Only whitespace / empty lines — the while loop would pop everything;
+    // spec says: "if the result is empty, fall back to the original message".
+    mockDryRun.mockRejectedValue(new Error("\n\n\n"));
+
+    const upload = makeUpload();
+    const wrapper = mount(DryRunPanel, { props: { upload } });
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    const emitted = wrapper.emitted("notify");
+    expect(emitted).toBeDefined();
+    expect(emitted).toHaveLength(1);
+    // Fallback: original message preserved verbatim.
+    expect(emitted![0]).toEqual([{ level: "error", message: "\n\n\n" }]);
+  });
+
+  it("tail: prefixed error ('package load failed: ...') surfaces the full single-line message", async () => {
+    // Regression check for items 4-5: the worker prefixes load/sandbox
+    // errors with "package load failed: " / "sandbox setup failed: ". If
+    // the host sees those as single-line Error.message, `tail()` must
+    // surface the prefix intact (the user needs the classification).
+    mockDryRun.mockRejectedValue(
+      new Error("package load failed: CDN unreachable"),
+    );
+
+    const upload = makeUpload();
+    const wrapper = mount(DryRunPanel, { props: { upload } });
+    await wrapper.find("button.btn--primary").trigger("click");
+    await flushPromises();
+
+    const emitted = wrapper.emitted("notify");
+    expect(emitted).toBeDefined();
+    expect(emitted).toHaveLength(1);
+    expect(emitted![0]).toEqual([
+      {
+        level: "error",
+        message: "package load failed: CDN unreachable",
+      },
+    ]);
+  });
+
   it("resets result to null when the upload prop changes", async () => {
     mockDryRun.mockResolvedValueOnce(sampleResult);
 

@@ -17,6 +17,27 @@ const loading = ref(false);
 const result = ref<DryRunResult | null>(null);
 
 /**
+ * Extracts the last non-empty line of a traceback string. The worker's
+ * `error.message` is a full Python traceback, which is unusable in a
+ * toast — the tail line (e.g. "RuntimeError: network access is disabled")
+ * is what the user needs.
+ *
+ * Algorithm (per spec §DryRunPanel.vue data flow step 5):
+ *   - split on "\n"
+ *   - drop trailing empty strings
+ *   - take the last element
+ *   - if the result is empty, fall back to the original message
+ */
+function tail(message: string): string {
+  const lines = message.split("\n");
+  while (lines.length > 0 && lines[lines.length - 1].length === 0) {
+    lines.pop();
+  }
+  const last = lines.length > 0 ? lines[lines.length - 1] : "";
+  return last.length > 0 ? last : message;
+}
+
+/**
  * Parse `upload.csv` into up to 3 data rows:
  *  - split on "\n"
  *  - trim each line
@@ -50,7 +71,7 @@ async function handleRun() {
   try {
     result.value = await dryRun(props.upload.script, csvRows.value);
   } catch (e: unknown) {
-    emit("notify", { level: "error", message: (e as Error).message });
+    emit("notify", { level: "error", message: tail((e as Error).message) });
   } finally {
     loading.value = false;
   }
