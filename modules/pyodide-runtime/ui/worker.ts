@@ -17,6 +17,14 @@ interface PyodideInterface {
     set(name: string, value: unknown): void;
   };
   loadPackagesFromImports(code: string): Promise<void>;
+  /**
+   * Map of package-name → install source (e.g. "default") for every
+   * package Pyodide has downloaded into MEMFS during this worker's
+   * lifetime. Authoritative list of what `loadPackagesFromImports` has
+   * made available so far. See exec handler's `import-loaded-packages`
+   * step for the only read site.
+   */
+  loadedPackages: Record<string, string>;
 }
 
 type WorkerState = "unloaded" | "loading" | "idle" | "running" | "error" | "terminated";
@@ -58,8 +66,15 @@ function errorMessage(e: unknown): string {
 
 /**
  * Resets the __main__ namespace and drops user-imported modules (and sandbox
- * stubs) so each exec starts clean; Pyodide-installed packages (numpy, etc.)
- * persist across calls by re-snapshotting sys.modules at the end.
+ * stubs) so each exec starts clean.
+ *
+ * Pyodide-installed packages (numpy, scipy, …) persist across calls because
+ * the exec handler refreshes `sys._initial_modules` AFTER
+ * `loadPackagesFromImports` (and after pre-importing the resulting packages
+ * into `sys.modules`) and BEFORE the user script runs. At cleanup time those
+ * packages are already part of the snapshot, so the removal loop below
+ * leaves them alone. See the post-`loadPackagesFromImports` block in the
+ * exec handler for the refresh itself.
  *
  * Trade-off: if a user script mutates a cached module (e.g. `np.array = ...`),
  * that mutation persists to subsequent execs. Acceptable because dry-run and
@@ -72,13 +87,13 @@ function cleanupPythonNamespace(): void {
     pyodide.runPython(`
 import sys
 
-# Snapshot of initial module names (builtins + stdlib loaded at init)
-if not hasattr(sys, '_initial_modules'):
-    sys._initial_modules = set(sys.modules.keys())
-
-# Remove any user-imported modules added since init. This also drops any
-# sandbox stub ModuleType entries we installed for this exec — the next
-# exec installs fresh stubs.
+# The init handler seeds sys._initial_modules once; the exec handler
+# refreshes it after loadPackagesFromImports so Pyodide-installed packages
+# are folded into the baseline and preserved across exec calls.
+# Remove any modules added since the snapshot — user-imported helpers and
+# sandbox stub ModuleType entries installed for this exec. The next exec
+# installs fresh stubs. Pyodide-installed packages are preserved because
+# they were part of the refreshed snapshot.
 _to_remove = [k for k in sys.modules.keys() if k not in sys._initial_modules]
 for _k in _to_remove:
     del sys.modules[_k]
@@ -93,8 +108,6 @@ for _k in _to_del:
         delattr(_main, _k)
     except Exception:
         pass
-
-sys._initial_modules = set(sys.modules.keys())
 `);
   } catch {
     // Cleanup is best-effort; do not fail the exec result
@@ -243,6 +256,61 @@ sys._initial_modules = set(sys.modules.keys())
       // Step 1: Load packages the script imports. Runs unsandboxed.
       try {
         await pyodide!.loadPackagesFromImports(script);
+      } catch (e: unknown) {
+        throw new Error("package load failed: " + errorMessage(e));
+      }
+
+      // Step 1.5: Pre-import every package Pyodide has loaded into MEMFS
+      // so that it lives in `sys.modules` BEFORE we refresh
+      // `sys._initial_modules`. Without this, the per-exec cleanup's
+      // removal loop would wipe numpy/scipy/pandas between rows (they
+      // are only added to sys.modules when the user script's own
+      // `import numpy` runs, i.e. AFTER the snapshot), which in turn
+      // produces the `UserWarning: The NumPy module was reloaded` on
+      // row 2+ and pays ~100-500 ms per subsequent exec to reload.
+      //
+      // `pyodide.loadedPackages` is the authoritative list of packages
+      // Pyodide has downloaded during this worker's lifetime; on exec
+      // N it includes everything from execs 1..N-1 plus anything the
+      // current script triggered. Importing an already-imported
+      // package is a no-op, so redoing the imports each exec is cheap.
+      //
+      // Pre-import is best-effort: if a package fails to import, we
+      // just skip it. The refresh of `sys._initial_modules` still
+      // happens so cleanup's baseline reflects whatever DID import.
+      // Wrapped under the same "package load failed" error prefix as
+      // step 1 because this is logically part of making packages
+      // available to the user script; it still runs unsandboxed.
+      try {
+        const loadedPackageNames = Object.keys(pyodide!.loadedPackages || {});
+        pyodide!.globals.set("__loaded_packages__", loadedPackageNames);
+        pyodide!.runPython(`
+import sys
+import importlib
+
+for _pyodide_pkg_name in __loaded_packages__:
+    try:
+        importlib.import_module(_pyodide_pkg_name)
+    except Exception:
+        # Best-effort: a package that fails to import here would also
+        # fail when the user script imports it; let that path surface
+        # the error, not this pre-warm.
+        pass
+
+try:
+    del _pyodide_pkg_name
+except NameError:
+    # __loaded_packages__ was empty (first exec with a script that
+    # imports no Pyodide-packaged deps) — nothing to delete.
+    pass
+
+# Refresh the baseline NOW — after Pyodide packages are in sys.modules,
+# before the user script's own imports (helpers, stdlib) add to it.
+# cleanupPythonNamespace() will preserve everything in this snapshot
+# and drop everything the user script added on top.
+sys._initial_modules = set(sys.modules.keys())
+`);
+        pyodide!.runPython("del __loaded_packages__");
       } catch (e: unknown) {
         throw new Error("package load failed: " + errorMessage(e));
       }

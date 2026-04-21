@@ -476,70 +476,91 @@ describe("worker.ts — network stubs + js./pyodide. setattr targets preserved (
 });
 
 // ---------------------------------------------------------------------------
-// Regression: cleanupPythonNamespace refreshes `sys._initial_modules` AFTER
-// the removal loops, so Pyodide-installed packages (numpy, scipy, openblas,
-// …) loaded during an exec are rolled into the baseline for the next exec.
+// Regression: the initial-modules snapshot refresh must live in the EXEC
+// HANDLER — specifically between `loadPackagesFromImports` (step 1) and
+// `applySandbox` (step 2), and after the loop that `importlib.import_module`s
+// every entry of `pyodide.loadedPackages`. That ordering is what makes
+// numpy/scipy/pandas part of the baseline for the next exec's cleanup.
 //
-// Earlier iteration wiped those packages between execs, producing
+// Earlier iteration placed the refresh at the TAIL of `cleanupPythonNamespace`
+// (i.e. AFTER the removal loop inside the same function). That is a no-op:
+// the removal loop deletes numpy from sys.modules, then the refresh snapshots
+// the post-removal state — so numpy is NOT in the baseline, and the next
+// exec's cleanup wipes it again. Result:
 //   UserWarning: The NumPy module was reloaded (imported a second time)
-// on row 2+ and paying ~100-500 ms per subsequent exec to reload them.
-// These assertions would have caught that at source level without Pyodide.
+// on row 2+, plus ~100-500 ms wasted per exec reloading the package.
+//
+// These source-level assertions pin the correct placement. The end-to-end
+// probe for browser mode lives as `it.skip` in dryRun.integration.test.ts
+// ("numpy not reloaded between exec calls").
 // ---------------------------------------------------------------------------
 
-describe("worker.ts — cleanupPythonNamespace refreshes initial-modules snapshot (numpy-reload regression)", () => {
-  it("cleanupPythonNamespace body contains an assignment to sys._initial_modules", () => {
-    // At minimum the refreshed snapshot at the end must be an assignment
-    // (not just a `hasattr` read). Without it, packages installed during
-    // this exec would be wiped on the next call.
-    const cleanupBody = getCleanupBody();
-    expect(cleanupBody).toMatch(/sys\._initial_modules\s*=\s*set\(/);
+describe("worker.ts — initial-modules snapshot refresh lives in the exec handler between loadPackagesFromImports and applySandbox (numpy-reload regression)", () => {
+  // Scope-local helper: slice once, reuse across tests in this block.
+  const execBody = getExecBlockBody();
+  const cleanupBody = getCleanupBody();
+
+  it("exec handler contains the refresh `sys._initial_modules = set(sys.modules.keys())`", () => {
+    // (a) — the refresh literal must appear in the exec handler body. If it
+    // lives only inside cleanupPythonNamespace, or not at all, the fix is
+    // absent or broken.
+    expect(execBody).toContain(
+      "sys._initial_modules = set(sys.modules.keys())",
+    );
   });
 
-  it("refresh assignment appears AFTER the `for _k in _to_remove: del sys.modules[_k]` loop", () => {
-    // If the refresh runs before the removal loop, the loop's deletions
-    // are immediately re-snapshotted-as-absent and the next exec re-wipes
-    // them — the fix becomes a no-op. Order is load-bearing.
-    const cleanupBody = getCleanupBody();
-    const removalIdx = cleanupBody.search(
-      /for\s+_k\s+in\s+_to_remove\s*:\s*\n\s*del\s+sys\.modules\[_k\]/,
-    );
-    expect(removalIdx).toBeGreaterThan(-1);
-
-    // Find the LAST `sys._initial_modules =` assignment — that's the
-    // refresh, as opposed to the init-guarded seed at the top of the
-    // function (which lives inside `if not hasattr(...)`).
-    const assignRe = /sys\._initial_modules\s*=\s*set\(/g;
-    let lastAssignIdx = -1;
-    let m: RegExpExecArray | null;
-    while ((m = assignRe.exec(cleanupBody)) !== null) {
-      lastAssignIdx = m.index;
-    }
-    expect(lastAssignIdx).toBeGreaterThan(-1);
-    expect(lastAssignIdx).toBeGreaterThan(removalIdx);
+  it("refresh appears AFTER `loadPackagesFromImports` in the exec handler", () => {
+    // (b) — positional ordering. The refresh must run once packages have been
+    // resolved, otherwise the baseline doesn't include them and cleanup wipes
+    // numpy/scipy/pandas every exec.
+    const loadIdx = execBody.indexOf("loadPackagesFromImports");
+    const refreshIdx = execBody.indexOf("sys._initial_modules = set");
+    expect(loadIdx).toBeGreaterThan(-1);
+    expect(refreshIdx).toBeGreaterThan(-1);
+    expect(refreshIdx).toBeGreaterThan(loadIdx);
   });
 
-  it("refresh assignment appears AFTER the __main__ namespace `delattr` loop", () => {
-    // Ordering invariant (spec-neutral but correctness-critical): the
-    // refresh must be the final statement of the cleanup, so the
-    // next-call baseline reflects the fully-cleaned state. If refresh
-    // ran before the __main__ delattr loop, __main__ user symbols
-    // wouldn't actually be part of sys.modules anyway (they live on
-    // __main__'s namespace), so it's spec-neutral — but a future reader
-    // could reasonably expect the refresh to close the function, and
-    // this ordering keeps that intuition intact.
-    const cleanupBody = getCleanupBody();
-    const delattrIdx = cleanupBody.search(
-      /for\s+_k\s+in\s+_to_del\s*:[\s\S]*?delattr\(_main,\s*_k\)/,
-    );
-    expect(delattrIdx).toBeGreaterThan(-1);
+  it("refresh appears BEFORE `applySandbox` in the exec handler", () => {
+    // (c) — the refresh must run unsandboxed. If it runs after applySandbox,
+    // `importlib.import_module` (the step that pulls loadedPackages into
+    // sys.modules before the snapshot) would hit sandbox-installed stubs
+    // (e.g. the socket stub) and poison the baseline. Keep it in the
+    // unsandboxed window between step 1 and step 2.
+    const refreshIdx = execBody.indexOf("sys._initial_modules = set");
+    const sandboxIdx = execBody.search(/\bapplySandbox\s*\(/);
+    expect(refreshIdx).toBeGreaterThan(-1);
+    expect(sandboxIdx).toBeGreaterThan(-1);
+    expect(refreshIdx).toBeLessThan(sandboxIdx);
+  });
 
-    const assignRe = /sys\._initial_modules\s*=\s*set\(/g;
-    let lastAssignIdx = -1;
-    let m: RegExpExecArray | null;
-    while ((m = assignRe.exec(cleanupBody)) !== null) {
-      lastAssignIdx = m.index;
-    }
-    expect(lastAssignIdx).toBeGreaterThan(-1);
-    expect(lastAssignIdx).toBeGreaterThan(delattrIdx);
+  it("exec handler calls `importlib.import_module` BEFORE the refresh", () => {
+    // (d) — the "actually import packages so they're in sys.modules" step
+    // must precede the snapshot. `loadPackagesFromImports` only downloads
+    // the wheels into MEMFS; until something does `importlib.import_module`
+    // (or the user's script imports them), they aren't in sys.modules and
+    // wouldn't be captured by the snapshot.
+    const importIdx = execBody.indexOf("importlib.import_module");
+    const refreshIdx = execBody.indexOf("sys._initial_modules = set");
+    expect(importIdx).toBeGreaterThan(-1);
+    expect(refreshIdx).toBeGreaterThan(-1);
+    expect(importIdx).toBeLessThan(refreshIdx);
+  });
+
+  it("cleanupPythonNamespace body does NOT contain `sys._initial_modules = set(`", () => {
+    // (e) — the broken ordering is gone. Placing the refresh at the tail of
+    // cleanup is a no-op because the removal loop runs first and deletes
+    // numpy before the snapshot sees it. The refresh now lives in the exec
+    // handler (see assertions above); cleanup must not contain any
+    // `sys._initial_modules = set(...)` assignment.
+    expect(cleanupBody).not.toMatch(/sys\._initial_modules\s*=\s*set\(/);
+  });
+
+  it("cleanupPythonNamespace still contains the `_to_remove` removal loop", () => {
+    // (f) — the fix preserves the removal infrastructure. cleanup continues
+    // to drop user-imported helpers and sandbox stubs added since the last
+    // snapshot; only the misplaced refresh is excised.
+    expect(cleanupBody).toContain(
+      "_to_remove = [k for k in sys.modules.keys() if k not in sys._initial_modules]",
+    );
   });
 });

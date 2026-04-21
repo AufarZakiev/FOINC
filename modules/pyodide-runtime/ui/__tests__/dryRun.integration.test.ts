@@ -113,10 +113,15 @@ describe("dryRun() — real Pyodide integration (requires vitest browser mode)",
   //   UserWarning: The NumPy module was reloaded (imported a second time)
   // on stderr — plus ~100-500 ms wasted per exec re-loading the package.
   //
-  // The fix refreshes sys._initial_modules at the end of cleanup so
-  // packages installed during an exec persist into the next row's
-  // baseline. Source-level ordering guards live in worker.source.test.ts;
-  // this is the end-to-end probe for browser mode.
+  // The fix moves the `sys._initial_modules = set(sys.modules.keys())`
+  // snapshot refresh OUT of cleanupPythonNamespace and INTO the exec
+  // handler — between `loadPackagesFromImports` (step 1) and
+  // `applySandbox` (step 2), after a loop that `importlib.import_module`s
+  // every entry of `pyodide.loadedPackages` so numpy/scipy/pandas are in
+  // sys.modules before the snapshot. cleanup's removal loop then leaves
+  // those packages alone because they are part of the baseline.
+  // Source-level ordering guards live in worker.source.test.ts; this is
+  // the end-to-end probe for browser mode.
   it.skip(
     "(browser) numpy not reloaded between exec calls — no UserWarning on row 2+",
     async () => {
